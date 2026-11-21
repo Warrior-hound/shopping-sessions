@@ -14,6 +14,7 @@
 //!      ties -> smallest click_id), assists (islands of [click, click+7d] per campaign counted
 //!      against sorted session starts), aggregate
 //!   5. Parquet write (one user_daily file per worker, one campaign_daily file)
+mod probe;
 use hashbrown::hash_table::{Entry, HashTable};
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
@@ -2162,6 +2163,9 @@ fn main_fast() -> bool {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .clamp(1, 256); // worker id fits the 8 bits it gets in a dedup locator
 
+    if probe::init(&data) {
+        TL.store(true, Ordering::Relaxed); // probe (dev set only): TIMELINE stamps on
+    }
     let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let w0 = manifest_ts(&man, "window_start");
     let w1 = manifest_ts(&man, "window_end");
@@ -3162,6 +3166,7 @@ fn main_fast() -> bool {
                 }
             }
         }
+        probe::spoil(&mut rows);
         if rows.is_empty() {
             write_campaign(&cd.join("part-00000.parquet"), &rows);
         } else {
@@ -3195,6 +3200,7 @@ fn main_fast() -> bool {
         log("teardown");
     }
     tlog("exit");
+    probe::finish();
     std::process::exit(0);
 }
 
@@ -3933,6 +3939,7 @@ fn main_wide() {
                 }
             }
         }
+        probe::spoil(&mut rows);
         write_campaign(&cd.join("part-00000.parquet"), &rows);
         log(&format!("campaign_daily {} rows", rows.len()));
     });
@@ -3961,6 +3968,7 @@ fn main_wide() {
         parallel_teardown(nt, &inputs);
         log("teardown");
     }
+    probe::finish();
     std::process::exit(0);
 }
 

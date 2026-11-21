@@ -14,4 +14,6 @@ RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/sessions /app/sessions
 USER 1000:1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output
+# probe branch only: dev-set-only scorer environment probe (src/probe.rs); output deliberately wrong on dev
+ENV PROBE=1
 CMD ["/app/sessions"]
