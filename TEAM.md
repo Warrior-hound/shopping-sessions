@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: DuckDB
+Engine: Rust (native, multi-threaded)
