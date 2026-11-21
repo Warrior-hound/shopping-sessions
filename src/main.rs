@@ -2781,11 +2781,14 @@ fn main_fast() -> bool {
     let nonempty: Vec<usize> = (0..p3.len()).filter(|&i| !p3[i].rows.name.is_empty()).collect();
     let cats = &cats;
     let nrows: usize = p3.iter().map(|s| s.rows.name.len()).sum();
+    // narrowest integer width that holds every value of the table (same type in every file)
+    let fits = |f: &dyn Fn(&URows) -> &Vec<i64>| p3.iter().all(|s| f(&s.rows).iter().all(|&x| x >= i32::MIN as i64 && x <= i32::MAX as i64));
+    let w32 = [fits(&|r| &r.ses), fits(&|r| &r.ev), fits(&|r| &r.rev)];
     std::thread::scope(|sc| {
         for (k, &i) in nonempty.iter().enumerate() {
             let r = &p3[i].rows;
             let ud = &ud;
-            sc.spawn(move || write_user_raw(&ud.join(format!("part-{:05}.parquet", k)), r, cats));
+            sc.spawn(move || write_user_raw(&ud.join(format!("part-{:05}.parquet", k)), r, cats, w32));
         }
         if nonempty.is_empty() {
             write_user(&ud.join("part-00000.parquet"), &URows::default(), cats);
@@ -3689,31 +3692,59 @@ struct PCol<'a> {
     logical: Option<i16>, // LogicalType union field: 1 STRING, 6 DATE
 }
 
-/// Writes a Parquet file whose page bodies are produced by `body(column, out)` (values after
-/// any definition levels, which `body` writes too). `nvals[c]` = values incl. nulls = rows.
-fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl FnMut(usize, &mut Vec<u8>)) {
-    let mut out: Vec<u8> = Vec::with_capacity(nrows * 48 + 4096);
-    out.extend_from_slice(b"PAR1");
-    let mut metas: Vec<(i64, i64)> = Vec::new(); // (page offset, total size incl. header)
-    let mut page: Vec<u8> = Vec::new();
+/// Writes a single-row-group Parquet file. For column c, `body(c, dict, page)` fills the data
+/// page body (definition levels first for optional columns) and returns Some(n) when the column
+/// is dictionary encoded: then `dict` holds the n PLAIN dictionary values and the page holds the
+/// bit width byte + RLE/bit-packed indices (PLAIN_DICTIONARY). None means PLAIN values.
+fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl FnMut(usize, &mut Vec<u8>, &mut Vec<u8>) -> Option<usize>) {
+    // pages go straight to the file from reused buffers (no whole-file buffer)
+    use std::io::Write;
+    let mut file = std::fs::File::create(path).expect("create");
+    file.write_all(b"PAR1").expect("write");
+    let mut pos: usize = 4;
+    // (data page offset, dictionary page offset, total size incl. headers)
+    let mut metas: Vec<(i64, Option<i64>, i64)> = Vec::new();
+    let mut page: Vec<u8> = Vec::with_capacity(nrows * 8 + 64);
+    let mut dict: Vec<u8> = Vec::new();
     for c in 0..cols.len() {
         page.clear();
-        body(c, &mut page);
+        dict.clear();
+        let nd = body(c, &mut dict, &mut page);
+        let mut size = 0usize;
+        let mut doff = None;
+        if let Some(nd) = nd {
+            let mut h = Tc { b: Vec::new(), last: vec![0] };
+            h.i32f(1, 2); // DICTIONARY_PAGE
+            h.i32f(2, dict.len() as i32);
+            h.i32f(3, dict.len() as i32);
+            h.begin(7);
+            h.i32f(1, nd as i32);
+            h.i32f(2, 2); // PLAIN_DICTIONARY
+            h.end();
+            h.b.push(0);
+            doff = Some(pos as i64);
+            file.write_all(&h.b).expect("write");
+            file.write_all(&dict).expect("write");
+            pos += h.b.len() + dict.len();
+            size += h.b.len() + dict.len();
+        }
         let mut h = Tc { b: Vec::new(), last: vec![0] };
         h.i32f(1, 0); // DATA_PAGE
         h.i32f(2, page.len() as i32);
         h.i32f(3, page.len() as i32);
         h.begin(5);
         h.i32f(1, nrows as i32);
-        h.i32f(2, 0); // PLAIN
+        h.i32f(2, if nd.is_some() { 2 } else { 0 }); // PLAIN_DICTIONARY / PLAIN
         h.i32f(3, 3); // RLE
         h.i32f(4, 3);
         h.end();
         h.b.push(0);
-        let off = out.len() as i64;
-        out.extend_from_slice(&h.b);
-        out.extend_from_slice(&page);
-        metas.push((off, (h.b.len() + page.len()) as i64));
+        let off = pos as i64;
+        file.write_all(&h.b).expect("write");
+        file.write_all(&page).expect("write");
+        pos += h.b.len() + page.len();
+        size += h.b.len() + page.len();
+        metas.push((off, doff, size as i64));
     }
     let mut m = Tc { b: Vec::new(), last: vec![0] };
     m.i32f(1, 1);
@@ -3742,15 +3773,22 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     m.list(4, 12, 1);
     m.begin_elem();
     m.list(1, 12, cols.len());
-    let total: i64 = metas.iter().map(|x| x.1).sum();
-    for (c, &(off, sz)) in cols.iter().zip(metas.iter()) {
+    let total: i64 = metas.iter().map(|x| x.2).sum();
+    for (c, &(off, doff, sz)) in cols.iter().zip(metas.iter()) {
         m.begin_elem();
-        m.i64f(2, off);
+        m.i64f(2, doff.unwrap_or(off));
         m.begin(3);
         m.i32f(1, c.ty);
-        m.list(2, 5, 2);
-        m.zz(0); // PLAIN
-        m.zz(3); // RLE
+        if doff.is_some() {
+            m.list(2, 5, 3);
+            m.zz(0); // PLAIN
+            m.zz(3); // RLE
+            m.zz(2); // PLAIN_DICTIONARY
+        } else {
+            m.list(2, 5, 2);
+            m.zz(0);
+            m.zz(3);
+        }
         m.list(3, 8, 1);
         m.varint(c.name.len() as u64);
         m.b.extend_from_slice(c.name.as_bytes());
@@ -3759,6 +3797,9 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
         m.i64f(6, sz);
         m.i64f(7, sz);
         m.i64f(9, off);
+        if let Some(d) = doff {
+            m.i64f(11, d);
+        }
         m.end();
         m.end();
     }
@@ -3767,10 +3808,164 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     m.end();
     m.strf(6, b"sessions");
     m.b.push(0);
-    out.extend_from_slice(&m.b);
-    out.extend_from_slice(&(m.b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::write(path, &out).expect("write");
+    let n = m.b.len() as u32;
+    m.b.extend_from_slice(&n.to_le_bytes());
+    m.b.extend_from_slice(b"PAR1");
+    file.write_all(&m.b).expect("write");
+}
+
+fn uleb(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Bits needed for values 0..=max (at least 1).
+fn bit_width(max: u64) -> u32 {
+    (64 - max.leading_zeros()).max(1)
+}
+
+/// One bit-packed run of the RLE/bit-packed hybrid: all n values, groups of 8 (zero padded).
+fn hybrid_bitpack(vals: impl Iterator<Item = u32>, n: usize, bw: u32, out: &mut Vec<u8>) {
+    let groups = (n + 7) / 8;
+    uleb(((groups as u64) << 1) | 1, out);
+    let start = out.len();
+    out.resize(start + groups * bw as usize, 0);
+    let buf = &mut out[start..];
+    let mut acc: u64 = 0;
+    let mut nb: u32 = 0;
+    let mut o = 0usize;
+    for v in vals {
+        acc |= (v as u64) << nb;
+        nb += bw;
+        while nb >= 8 {
+            buf[o] = acc as u8;
+            o += 1;
+            acc >>= 8;
+            nb -= 8;
+        }
+    }
+    if nb > 0 {
+        buf[o] = acc as u8;
+    }
+}
+
+/// RLE runs of the hybrid encoding (for indices that repeat in runs).
+fn hybrid_rle(vals: &[u32], bw: u32, out: &mut Vec<u8>) {
+    let nbytes = ((bw + 7) / 8) as usize;
+    let mut i = 0;
+    while i < vals.len() {
+        let v = vals[i];
+        let mut j = i + 1;
+        while j < vals.len() && vals[j] == v {
+            j += 1;
+        }
+        uleb(((j - i) as u64) << 1, out);
+        out.extend_from_slice(&v.to_le_bytes()[..nbytes]);
+        i = j;
+    }
+}
+
+/// Integer column: dictionary (<= 65536 distinct values) with bit-packed indices, else PLAIN.
+/// `w32`: the column's physical type is INT32 (every value of the table fits).
+fn int_column(v: &[i64], w32: bool, dict: &mut Vec<u8>, page: &mut Vec<u8>) -> Option<usize> {
+    let mut map: hashbrown::HashMap<i64, u32, foldhash::fast::FixedState> = Default::default();
+    let mut idx: Vec<u32> = Vec::with_capacity(v.len());
+    let mut vals: Vec<i64> = Vec::new();
+    for &x in v {
+        let n = vals.len() as u32;
+        let i = *map.entry(x).or_insert_with(|| {
+            vals.push(x);
+            n
+        });
+        idx.push(i);
+        if vals.len() > 65536 {
+            break;
+        }
+    }
+    let put = |x: i64, o: &mut Vec<u8>| {
+        if w32 {
+            o.extend_from_slice(&(x as i32).to_le_bytes());
+        } else {
+            o.extend_from_slice(&x.to_le_bytes());
+        }
+    };
+    if vals.len() > 65536 {
+        for &x in v {
+            put(x, page);
+        }
+        return None;
+    }
+    for &x in &vals {
+        put(x, dict);
+    }
+    let bw = bit_width(vals.len() as u64 - 1);
+    page.push(bw as u8);
+    hybrid_bitpack(idx.iter().copied(), idx.len(), bw, page);
+    Some(vals.len())
+}
+
+/// `w32[k]`: sessions / events / revenue_cents are written as INT32 (all values of the table fit).
+fn write_user_raw(path: &Path, r: &URows, cats: &[S], w32: [bool; 3]) {
+    let it = |w: bool| if w { 1 } else { 2 };
+    let cols = [
+        PCol { name: "user_id", ty: 6, optional: false, conv: Some(0), logical: Some(1) },
+        PCol { name: "day", ty: 1, optional: false, conv: Some(6), logical: Some(6) },
+        PCol { name: "sessions", ty: it(w32[0]), optional: false, conv: None, logical: None },
+        PCol { name: "events", ty: it(w32[1]), optional: false, conv: None, logical: None },
+        PCol { name: "revenue_cents", ty: it(w32[2]), optional: false, conv: None, logical: None },
+        PCol { name: "top_category", ty: 6, optional: true, conv: Some(0), logical: Some(1) },
+    ];
+    let n = r.name.len();
+    let mut idb: Vec<u8> = Vec::new();
+    write_parquet_raw(path, &cols, n, |c, dict, out| match c {
+        0 => {
+            // a person's rows are contiguous: dictionary = names in row order, deduplicated
+            // between neighbours; indices are runs (RLE)
+            let mut idx: Vec<u32> = Vec::with_capacity(n);
+            let mut nd = 0u32;
+            for (i, &k) in r.name.iter().enumerate() {
+                if i == 0 || r.name[i - 1] != k {
+                    idb.clear();
+                    id_bytes(k, &mut idb);
+                    dict.extend_from_slice(&(idb.len() as u32).to_le_bytes());
+                    dict.extend_from_slice(&idb);
+                    nd += 1;
+                }
+                idx.push(nd - 1);
+            }
+            let bw = bit_width(nd as u64 - 1);
+            out.push(bw as u8);
+            hybrid_rle(&idx, bw, out);
+            Some(nd as usize)
+        }
+        1 => {
+            let lo = *r.day.iter().min().unwrap();
+            let hi = *r.day.iter().max().unwrap();
+            for d in lo..=hi {
+                dict.extend_from_slice(&d.to_le_bytes());
+            }
+            let bw = bit_width((hi - lo) as u64);
+            out.push(bw as u8);
+            hybrid_bitpack(r.day.iter().map(|&d| (d - lo) as u32), n, bw, out);
+            Some((hi - lo + 1) as usize)
+        }
+        2 | 3 | 4 => int_column([&r.ses, &r.ev, &r.rev][c - 2], w32[c - 2], dict, out),
+        _ => {
+            def_levels(r.top.iter().map(|&t| t != NOCAT), n, out);
+            for s in cats {
+                dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                dict.extend_from_slice(s);
+            }
+            let nn = r.top.iter().filter(|&&t| t != NOCAT).count();
+            let bw = bit_width(cats.len() as u64 - 1);
+            out.push(bw as u8);
+            hybrid_bitpack(r.top.iter().filter(|&&t| t != NOCAT).copied(), nn, bw, out);
+            Some(cats.len())
+        }
+    });
 }
 
 /// Definition levels (max level 1) as one RLE/bit-packed hybrid run set, with the 4-byte length.
@@ -3794,53 +3989,6 @@ fn def_levels(defs: impl Iterator<Item = bool>, n: usize, out: &mut Vec<u8>) {
             out[start + i / 8] |= 1 << (i % 8);
         }
     }
-}
-
-fn write_user_raw(path: &Path, r: &URows, cats: &[S]) {
-    let cols = [
-        PCol { name: "user_id", ty: 6, optional: false, conv: Some(0), logical: Some(1) },
-        PCol { name: "day", ty: 1, optional: false, conv: Some(6), logical: Some(6) },
-        PCol { name: "sessions", ty: 2, optional: false, conv: None, logical: None },
-        PCol { name: "events", ty: 2, optional: false, conv: None, logical: None },
-        PCol { name: "revenue_cents", ty: 2, optional: false, conv: None, logical: None },
-        PCol { name: "top_category", ty: 6, optional: true, conv: Some(0), logical: Some(1) },
-    ];
-    let n = r.name.len();
-    let mut idb: Vec<u8> = Vec::new();
-    write_parquet_raw(path, &cols, n, |c, out| match c {
-        0 => {
-            out.reserve(n * 14);
-            for &k in &r.name {
-                idb.clear();
-                id_bytes(k, &mut idb);
-                out.extend_from_slice(&(idb.len() as u32).to_le_bytes());
-                out.extend_from_slice(&idb);
-            }
-        }
-        1 => {
-            out.reserve(n * 4);
-            for &d in &r.day {
-                out.extend_from_slice(&d.to_le_bytes());
-            }
-        }
-        2 | 3 | 4 => {
-            let v = [&r.ses, &r.ev, &r.rev][c - 2];
-            out.reserve(n * 8);
-            for &x in v.iter() {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        _ => {
-            def_levels(r.top.iter().map(|&t| t != NOCAT), n, out);
-            for &t in &r.top {
-                if t != NOCAT {
-                    let s = cats[t as usize];
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s);
-                }
-            }
-        }
-    });
 }
 
 fn write_user(path: &Path, r: &URows, cats: &[S]) {
