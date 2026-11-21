@@ -1,4 +1,0 @@
-sessions.profdata: LLVM PGO profile for src/main.rs, used by the Dockerfile (-Cprofile-use).
-Made with rust:1.85 (same image as the build stage): an instrumented build (-Cprofile-generate, same flags)
-run 3 times on a 20M-event synthetic data set (generator seed 7, NCPU=8), merged with llvm-profdata.
-Regenerate after every change to src/. A stale profile only loses benefit; it never changes results.
