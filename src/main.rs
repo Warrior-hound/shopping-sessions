@@ -95,6 +95,20 @@ static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Ve
 
 /// Zeroed, 2 MB-aligned region of at least `bytes` (lazily backed; never freed by Drop).
 fn huge_region(bytes: usize) -> *mut u8 {
+    match try_huge_region(bytes) {
+        Some(p) => p,
+        None => {
+            // address-space limit (RLIMIT_AS, overcommit=2): plain zeroed heap memory
+            let len = bytes.max(1);
+            let p = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(len, 64).unwrap()) };
+            assert!(!p.is_null(), "out of memory ({} bytes)", len);
+            p
+        }
+    }
+}
+
+/// `huge_region`, or None when the reservation is refused.
+fn try_huge_region(bytes: usize) -> Option<*mut u8> {
     let len = (bytes.max(1) + HUGE - 1) / HUGE * HUGE;
     #[cfg(unix)]
     unsafe {
@@ -107,7 +121,7 @@ fn huge_region(bytes: usize) -> *mut u8 {
             0,
         );
         if raw == libc::MAP_FAILED {
-            panic!("mmap {} bytes failed", len + HUGE);
+            return None;
         }
         let a = (raw as usize + HUGE - 1) / HUGE * HUGE;
         // trim the unaligned head and tail so the region is exactly [a, a + len)
@@ -122,13 +136,47 @@ fn huge_region(bytes: usize) -> *mut u8 {
             libc::madvise(a as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
         }
         REGIONS.lock().unwrap().push((a, len));
-        a as *mut u8
+        Some(a as *mut u8)
     }
     #[cfg(not(unix))]
     unsafe {
         let p = std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(len, HUGE).unwrap());
-        assert!(!p.is_null(), "alloc failed");
-        p
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+}
+
+/// One reservation shared by a phase's workers; each worker takes 2 MB slabs with an atomic
+/// bump, so the total reserved is the phase's real need (not workers x worst case). If the
+/// reservation is refused, smaller sizes are tried, down to none (all blocks from the heap).
+struct Region {
+    base: usize,
+    cap: usize,
+    next: AtomicUsize,
+}
+const SLAB: usize = HUGE;
+
+impl Region {
+    fn new(bytes: usize) -> &'static Region {
+        let mut want = (bytes.max(1) + SLAB - 1) / SLAB * SLAB;
+        let (mut base, mut cap) = (0usize, 0usize);
+        if cfg!(unix) {
+            while want >= (64 << 20) {
+                if let Some(p) = try_huge_region(want) {
+                    base = p as usize;
+                    cap = want;
+                    break;
+                }
+                want /= 2;
+            }
+            if cap == 0 {
+                log(&format!("arena reservation of {} bytes refused: heap blocks", bytes));
+            }
+        }
+        Box::leak(Box::new(Region { base, cap, next: AtomicUsize::new(0) }))
     }
 }
 
@@ -162,9 +210,9 @@ fn parallel_teardown(nt: usize, extra: &[(usize, usize)]) {
 
 /// Bump allocator over one huge region (one per worker, single-threaded use).
 struct Arena {
-    base: *mut u8,
-    off: usize,
-    cap: usize,
+    reg: &'static Region,
+    cur: *mut u8,
+    end: *mut u8,
     // consumed BLK_BYTES blocks (already faulted in): reused before fresh arena memory,
     // so later scatter phases write into warm pages instead of zeroing new ones
     free: Vec<*mut u8>,
@@ -173,9 +221,8 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    fn new(bytes: usize) -> Arena {
-        let cap = (bytes.max(1) + HUGE - 1) / HUGE * HUGE;
-        Arena { base: huge_region(cap), off: 0, cap, free: Vec::new() }
+    fn new(reg: &'static Region) -> Arena {
+        Arena { reg, cur: std::ptr::null_mut(), end: std::ptr::null_mut(), free: Vec::new() }
     }
     #[inline(never)]
     fn block(&mut self) -> *mut u8 {
@@ -183,16 +230,21 @@ impl Arena {
         if let Some(p) = self.free.pop() {
             return p;
         }
-        if self.off + bytes <= self.cap {
-            let p = unsafe { self.base.add(self.off) };
-            self.off += bytes;
-            p
-        } else {
-            // arena exhausted (pathological inputs): fall back to a leaked heap block
-            let p = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(bytes, 64).unwrap()) };
-            assert!(!p.is_null(), "alloc failed");
-            p
+        if (self.end as usize) - (self.cur as usize) < bytes {
+            let off = self.reg.next.fetch_add(SLAB, Ordering::Relaxed);
+            if off + SLAB <= self.reg.cap {
+                self.cur = (self.reg.base + off) as *mut u8;
+                self.end = (self.reg.base + off + SLAB) as *mut u8;
+            } else {
+                // region exhausted or absent: a leaked heap block
+                let p = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(bytes, 64).unwrap()) };
+                assert!(!p.is_null(), "out of memory");
+                return p;
+            }
         }
+        let p = self.cur;
+        self.cur = unsafe { p.add(bytes) };
+        p
     }
 }
 
@@ -463,7 +515,7 @@ fn ingest_ms(s: &[u8]) -> i64 {
         let h = d(11) * 10 + d(12);
         let mi = d(14) * 10 + d(15);
         let se = d(17) * 10 + d(18);
-        ((days_from_civil(y, mo, dd) * 24 + h) * 60 + mi) * 60_000 + se * 1000
+        ((days_fast(y, mo, dd) * 24 + h) * 60 + mi) * 60_000 + se * 1000
     } else {
         parse_ts(s).unwrap_or(i64::MAX / 4)
     }
@@ -481,7 +533,31 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+/// days_from_civil(y, m, 1) for y in [MY0, MY0 + MYN), m in 1..=12: no divisions on the hot path.
+const MY0: i64 = 1900;
+const MYN: usize = 400;
+static MONTH0: [i64; MYN * 12] = {
+    let mut t = [0i64; MYN * 12];
+    let mut i = 0;
+    while i < MYN * 12 {
+        t[i] = days_from_civil(MY0 + (i / 12) as i64, (i % 12) as i64 + 1, 1);
+        i += 1;
+    }
+    t
+};
+
+/// days_from_civil(y, m, d), via the month table when y and m are in its range.
+#[inline(always)]
+fn days_fast(y: i64, m: i64, d: i64) -> i64 {
+    let yi = y - MY0;
+    if (0..MYN as i64).contains(&yi) && (1..=12).contains(&m) {
+        MONTH0[yi as usize * 12 + (m - 1) as usize] + d - 1
+    } else {
+        days_from_civil(y, m, d)
+    }
+}
+
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
@@ -629,7 +705,7 @@ fn parse_ts_fast(s: &[u8]) -> Option<i64> {
             if dd < 1 || dd > dim || h > 23 || mi > 59 || se > 59 {
                 return None;
             }
-            let base = ((days_from_civil(y, mo, dd) * 24 + h) * 60 + mi) * 60_000 + se * 1000;
+            let base = ((days_fast(y, mo, dd) * 24 + h) * 60 + mi) * 60_000 + se * 1000;
             if is_f1 {
                 return Some(base);
             }
@@ -700,6 +776,23 @@ fn map_file(p: &Path) -> Option<S> {
     Some(&m[..])
 }
 
+/// Map the chunk's page-cache pages in one call (MADV_POPULATE_READ, Linux >= 5.14) instead of
+/// one fault per fault-around window. Errors (older kernels) are ignored: it is only a hint.
+#[inline]
+fn populate(d: S, s: usize, e: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if POPULATE.load(Ordering::Relaxed) {
+            let a = (d.as_ptr() as usize + s) & !4095;
+            let b = d.as_ptr() as usize + e;
+            libc::madvise(a as *mut libc::c_void, b - a, 22 /* MADV_POPULATE_READ */);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (d, s, e);
+}
+static POPULATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn chunks(files: &[S], ch: usize) -> Vec<(S, usize, usize)> {
     let mut out = Vec::new();
     for &d in files {
@@ -757,8 +850,13 @@ struct LongIds {
     map: hashbrown::HashMap<S, u32, foldhash::fast::FixedState>,
     list: Vec<S>,
 }
-static LONG: std::sync::Mutex<Option<LongIds>> = std::sync::Mutex::new(None);
-static LONG_LIST: std::sync::OnceLock<Vec<S>> = std::sync::OnceLock::new();
+/// Interner for IDs that do not pack: hash-sharded (shard = top bits of a full-bytes hash),
+/// one mutex per shard, so parallel parsers rarely contend. Keys carry (index, shard); their
+/// numeric value is never used for ordering (`id_cmp` compares bytes), so outputs do not
+/// depend on insertion order.
+const NSHARD: usize = 64;
+static LONG: [std::sync::Mutex<Option<LongIds>>; NSHARD] = [const { std::sync::Mutex::new(None) }; NSHARD];
+static LONG_LIST: std::sync::OnceLock<Vec<Vec<S>>> = std::sync::OnceLock::new();
 
 #[inline]
 fn idk(s: S) -> K {
@@ -780,7 +878,8 @@ fn idk(s: S) -> K {
 
 #[inline(never)]
 fn idk_long(s: S) -> K {
-    let mut g = LONG.lock().unwrap();
+    let sh = (hs(s) >> 58) as usize;
+    let mut g = LONG[sh].lock().unwrap();
     let l = g.get_or_insert_with(|| LongIds { map: Default::default(), list: Vec::new() });
     let i = match l.map.get(s) {
         Some(&i) => i,
@@ -791,13 +890,12 @@ fn idk_long(s: S) -> K {
             i
         }
     };
-    ((i as u64) << 4) | 0xF
+    ((((i as u64) << 6) | sh as u64) << 4) | 0xF
 }
 
 /// Freeze the long-ID list (call once all parsing is done).
 fn freeze_long() {
-    let g = LONG.lock().unwrap();
-    let v = g.as_ref().map(|l| l.list.clone()).unwrap_or_default();
+    let v: Vec<Vec<S>> = LONG.iter().map(|m| m.lock().unwrap().as_ref().map(|l| l.list.clone()).unwrap_or_default()).collect();
     let _ = LONG_LIST.set(v);
 }
 
@@ -807,13 +905,18 @@ fn is_long(k: K) -> bool {
 }
 
 /// Bytes of an ID key. Long keys need `freeze_long` (or the interner) to have run.
+fn long_bytes(k: K) -> S {
+    let i = (k >> 4) as usize;
+    let (sh, idx) = (i & (NSHARD - 1), i >> 6);
+    match LONG_LIST.get() {
+        Some(v) => v[sh][idx],
+        None => LONG[sh].lock().unwrap().as_ref().unwrap().list[idx],
+    }
+}
+
 fn id_bytes(k: K, out: &mut Vec<u8>) {
     if is_long(k) {
-        let i = (k >> 4) as usize;
-        match LONG_LIST.get() {
-            Some(v) => out.extend_from_slice(v[i]),
-            None => out.extend_from_slice(LONG.lock().unwrap().as_ref().unwrap().list[i]),
-        }
+        out.extend_from_slice(long_bytes(k));
     } else {
         let n = (k & 0xF) as usize;
         let code = k >> 4;
@@ -828,10 +931,20 @@ fn id_cmp(a: K, b: K) -> std::cmp::Ordering {
     if !is_long(a) && !is_long(b) {
         return a.cmp(&b);
     }
-    let (mut x, mut y) = (Vec::new(), Vec::new());
-    id_bytes(a, &mut x);
-    id_bytes(b, &mut y);
-    x.cmp(&y)
+    // no allocation: long IDs are slices of the input, short ones decode into a stack buffer
+    fn bytes(k: K, buf: &mut [u8; 10]) -> &[u8] {
+        if is_long(k) {
+            return long_bytes(k);
+        }
+        let n = (k & 0xF) as usize;
+        let code = k >> 4;
+        for j in 0..n {
+            buf[j] = SYM[((code >> (6 * (9 - j))) & 63) as usize];
+        }
+        &buf[..n]
+    }
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    bytes(a, &mut x).cmp(bytes(b, &mut y))
 }
 
 #[inline]
@@ -862,7 +975,18 @@ struct CRaw {
     camp: u32,
 }
 
-/// Surviving event, bucketed by hash(person).
+/// Dedup stream: one per event copy, bucketed by hash(event_id). `loc` addresses the copy's
+/// record in its worker's valid-copy stream (worker << 40 | index), or NOLOC when the copy
+/// itself failed validation (it can still win, which drops the event).
+#[derive(Clone, Copy)]
+struct DRec {
+    key: K,
+    ing: i64,
+    loc: u64,
+}
+const NOLOC: u64 = u64::MAX;
+
+/// Surviving event, bucketed by hash(person). Also the valid-copy stream record (pk = user key).
 #[derive(Clone, Copy)]
 struct PRec {
     pk: K,
@@ -1156,29 +1280,51 @@ fn main() {
     log(&format!("products {} ({} cats), campaigns {}", prod.len(), cats.len(), ncamp));
 
     // ---------------------------------------------------------- parse events + clicks
+    POPULATE.store(std::env::var_os("NOPOPULATE").is_none(), Ordering::Relaxed);
     let ech = chunks(&ev_files, 4 << 20);
     let cch = chunks(&cl_files, 4 << 20);
     let ne = ech.len();
     struct P1 {
+        w: u64,
         ar: Arena,
-        ev: Vec<Bkt<ERec>>,
+        dd: Vec<Bkt<DRec>>, // dedup stream, by hash(event_id), npd partitions
+        pv: Bkt<PRec>,      // valid copies in parse order (sequential, no scatter)
         cl: Bkt<CRaw>,
         t_ev: f64,
         t_cl: f64,
     }
+    // dedup partitions: small enough that each partition's table stays in L2
+    let mut npd = 256usize;
+    while npd < 65536 && npd * (2 << 20) < total {
+        npd *= 2;
+    }
+    if let Some(v) = std::env::var("ND").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| v.is_power_of_two()) {
+        npd = v; // knob for A/B only
+    }
+    let dmask = (npd - 1) as u64;
     let (cw0, cw1) = (w0 - WEEK, w1);
     // Generous per-(worker, partition) capacities: untouched reserved pages cost nothing,
     // and pre-sizing avoids realloc copies (and their page faults) while scattering.
     let ev_bytes: usize = ev_files.iter().map(|d| d.len()).sum();
     let cl_bytes: usize = cl_files.iter().map(|d| d.len()).sum();
+    let reg1 = Region::new(ev_bytes / 40 * (std::mem::size_of::<DRec>() + std::mem::size_of::<PRec>()) + cl_bytes / 30 * std::mem::size_of::<CRaw>() + nt * ((npd + 2) * BLK_BYTES + SLAB));
     let p1 = par(
         nt,
         ne + cch.len(),
-        |_| P1 { ar: Arena::new(ev_bytes / 40 * std::mem::size_of::<ERec>() + cl_bytes / 30 * std::mem::size_of::<CRaw>() + np * BLK_BYTES), ev: (0..np).map(|_| Bkt::new()).collect(), cl: Bkt::new(), t_ev: 0.0, t_cl: 0.0 },
+        |w| P1 {
+            w: w as u64,
+            ar: Arena::new(reg1),
+            dd: (0..npd).map(|_| Bkt::new()).collect(),
+            pv: Bkt::new(),
+            cl: Bkt::new(),
+            t_ev: 0.0,
+            t_cl: 0.0,
+        },
         |st, t| {
             let tt = tcpu();
             if t < ne {
                 let (d, s, e) = ech[t];
+                populate(d, s, e);
                 let lim = d.as_ptr() as usize + d.len();
                 for_rows::<7>(d, s, e, |f| {
                     if f[0].is_empty() {
@@ -1230,11 +1376,19 @@ fn main() {
                     }
                     let key = idk16(f[0], lim);
                     let h = h128(key);
-                    st.ev[((h >> 40) & pmask) as usize].push(&mut st.ar, ERec { key, ukey, ts, ing, price, cat });
+                    let loc = if ts != BAD {
+                        let l = (st.w << 40) | st.pv.len() as u64;
+                        st.pv.push(&mut st.ar, PRec { pk: ukey, ts, price, cat });
+                        l
+                    } else {
+                        NOLOC
+                    };
+                    st.dd[((h >> 40) & dmask) as usize].push(&mut st.ar, DRec { key, ing, loc });
                 });
                 st.t_ev += tcpu() - tt;
             } else {
                 let (d, s, e) = cch[t - ne];
+                populate(d, s, e);
                 let lim = d.as_ptr() as usize + d.len();
                 for_rows::<4>(d, s, e, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
@@ -1255,16 +1409,19 @@ fn main() {
         },
     );
     {
-        let ne: usize = p1.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
+        let ne: usize = p1.iter().map(|s| s.dd.iter().map(|v| v.len()).sum::<usize>()).sum();
         let nc: usize = p1.iter().map(|s| s.cl.len()).sum();
         let te: f64 = p1.iter().map(|s| s.t_ev).sum();
         let tc: f64 = p1.iter().map(|s| s.t_cl).sum();
         log(&format!("parsed: {} event copies ({:.2} thread-s), {} valid clicks ({:.2} thread-s)", ne, te, nc, tc));
     }
 
-    // ---------------------------------------------------------- dedup events, map persons
-    // tasks: [0, np) event partitions, then click slices
-    const CSLB: usize = 64; // click blocks per task
+    // ---------------------------------------------------------- dedup (kill list), map persons
+    // Phase 2a: per dedup partition, keep the min-ingest copy of each event_id and set the
+    // kill bit of every other copy that has a valid-copy record. Click tasks (person map +
+    // scatter) run in the same pass. Phase 2b: stream the valid copies, skip killed ones, map
+    // to persons and scatter by hash(person).
+    const CSLB: usize = 64; // blocks per stream task
     let cl_slices: Vec<Vec<&[CRaw]>> = p1.iter().map(|s| s.cl.slices().collect()).collect();
     let mut ctasks: Vec<(usize, usize)> = Vec::new();
     for (w, s) in cl_slices.iter().enumerate() {
@@ -1274,67 +1431,99 @@ fn main() {
             a += CSLB;
         }
     }
+    let mut woff: Vec<usize> = vec![0; p1.len() + 1];
+    for (w, s) in p1.iter().enumerate() {
+        woff[w + 1] = woff[w] + s.pv.len();
+    }
+    let nvalid = woff[p1.len()];
+    let kill: Vec<std::sync::atomic::AtomicU64> = (0..(nvalid + 63) / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let kill_loc = |loc: u64| {
+        if loc != NOLOC {
+            let g = woff[(loc >> 40) as usize] + (loc & ((1 << 40) - 1)) as usize;
+            kill[g >> 6].fetch_or(1 << (g & 63), Ordering::Relaxed);
+        }
+    };
     struct P2 {
         ar: Arena,
         ev: Vec<Bkt<PRec>>,
         cl: Vec<Bkt<CRec>>,
+        tab: Vec<DRec>,
+        kills: usize,
+        winners: usize,
+        valid_winners: usize,
         t_dd: f64,
         t_map: f64,
         t_cl: f64,
     }
-    let p2 = par(
+    let new_p2 = |a: &'static Region| P2 {
+        ar: Arena::new(a),
+        ev: (0..np).map(|_| Bkt::new()).collect(),
+        cl: (0..np).map(|_| Bkt::new()).collect(),
+        tab: Vec::new(),
+        kills: 0,
+        winners: 0,
+        valid_winners: 0,
+        t_dd: 0.0,
+        t_map: 0.0,
+        t_cl: 0.0,
+    };
+    let reg2c = Region::new(cl_bytes / 30 * std::mem::size_of::<CRec>() + nt * ((np + 2) * BLK_BYTES + SLAB));
+    let p2c = par(
         nt,
-        np + ctasks.len(),
-        |_| P2 { ar: Arena::new(ev_bytes / 40 * std::mem::size_of::<PRec>() + cl_bytes / 30 * std::mem::size_of::<CRec>() + 2 * np * BLK_BYTES), ev: (0..np).map(|_| Bkt::new()).collect(), cl: (0..np).map(|_| Bkt::new()).collect(), t_dd: 0.0, t_map: 0.0, t_cl: 0.0 },
+        npd + ctasks.len(),
+        |_| new_p2(reg2c),
         |st, p| {
             let tt = tcpu();
-            if p < np {
-                let cap: usize = p1.iter().map(|s| s.ev[p].len()).sum();
-                // event_id -> (ingest of the kept copy, worker, index); min ingest wins
-                // event_id -> kept copy (smallest ingest_ts). The table holds the records
-                // themselves, so reading the winners back is one sequential sweep.
-                let mut tab: HashTable<ERec> = HashTable::with_capacity(cap);
+            if p < npd {
+                let cap: usize = p1.iter().map(|s| s.dd[p].len()).sum();
+                let mut sz = 16usize;
+                while sz < cap * 2 {
+                    sz *= 2;
+                }
+                let mask = sz - 1;
+                st.tab.clear();
+                st.tab.resize(sz, DRec { key: 0, ing: 0, loc: 0 }); // key 0 = empty slot (empty event_ids are dropped)
+                let tab = &mut st.tab;
+                let (mut kills, mut winners, mut valid_winners) = (0usize, 0usize, 0usize);
                 for s in p1.iter() {
-                    for r in s.ev[p].iter() {
-                        match tab.entry(h128(r.key), |e| e.key == r.key, |e| h128(e.key)) {
-                            Entry::Occupied(mut o) => {
-                                let e = o.get_mut();
+                    for r in s.dd[p].iter() {
+                        let mut i = (h128(r.key) >> 8) as usize & mask;
+                        loop {
+                            let e = &mut tab[i];
+                            if e.key == r.key {
+                                // smallest ingest wins; equal ingests are identical copies (keep the first)
                                 if r.ing < e.ing {
+                                    kills += (e.loc != NOLOC) as usize;
+                                    kill_loc(e.loc);
+                                    valid_winners -= (e.loc != NOLOC) as usize;
+                                    valid_winners += (r.loc != NOLOC) as usize;
                                     *e = *r;
+                                } else {
+                                    kills += (r.loc != NOLOC) as usize;
+                                    kill_loc(r.loc);
                                 }
+                                break;
                             }
-                            Entry::Vacant(v) => {
-                                v.insert(*r);
+                            if e.key == 0 {
+                                *e = *r;
+                                winners += 1;
+                                valid_winners += (r.loc != NOLOC) as usize;
+                                break;
                             }
+                            i = (i + 1) & mask;
                         }
                     }
                 }
+                st.kills += kills;
+                st.winners += winners;
+                st.valid_winners += valid_winners;
                 // bucket p of every worker is consumed: reuse its blocks for this worker's pushes
                 for s in p1.iter() {
-                    s.ev[p].recycle_into(&mut st.ar);
+                    s.dd[p].recycle_into(&mut st.ar);
                 }
-                let t1 = tcpu();
-                st.t_dd += t1 - tt;
-                let links = links_wait();
-                // person lookups straight off the table (no survivor copy); a second iterator
-                // runs PF survivors ahead and prefetches their link-table slots
-                let mut ahead = tab.iter().filter(|r| r.ts != BAD);
-                for _ in 0..PF {
-                    if let Some(r) = ahead.next() {
-                        links.prefetch(r.ukey);
-                    }
-                }
-                for r in tab.iter().filter(|r| r.ts != BAD) {
-                    if let Some(a) = ahead.next() {
-                        links.prefetch(a.ukey);
-                    }
-                    let pk = links.person(r.ukey);
-                    st.ev[((h128(pk) >> 40) & pmask) as usize].push(&mut st.ar, PRec { pk, ts: r.ts, price: r.price, cat: r.cat });
-                }
-                drop(tab);
-                st.t_map += tcpu() - t1;
+                st.t_dd += tcpu() - tt;
             } else {
-                let (w, a) = ctasks[p - np];
+                let (w, a) = ctasks[p - npd];
                 let links = links_wait();
                 let v = &cl_slices[w];
                 for sl in &v[a..(a + CSLB).min(v.len())] {
@@ -1352,12 +1541,63 @@ fn main() {
             }
         },
     );
+    // phase 2b over the valid-copy streams
+    let pv_slices: Vec<Vec<&[PRec]>> = p1.iter().map(|s| s.pv.slices().collect()).collect();
+    let mut vtasks: Vec<(usize, usize)> = Vec::new();
+    for (w, s) in pv_slices.iter().enumerate() {
+        let mut a = 0;
+        while a < s.len() {
+            vtasks.push((w, a));
+            a += CSLB;
+        }
+    }
+    let per_pv = BLK_BYTES / std::mem::size_of::<PRec>();
+    let reg2 = Region::new(ev_bytes / 40 * std::mem::size_of::<PRec>() + nt * ((np + 2) * BLK_BYTES + SLAB));
+    let p2 = par(
+        nt,
+        vtasks.len(),
+        |_| new_p2(reg2),
+        |st, t| {
+            let tt = tcpu();
+            let (w, a) = vtasks[t];
+            let links = links_wait();
+            let v = &pv_slices[w];
+            for (bi, sl) in v[a..(a + CSLB).min(v.len())].iter().enumerate() {
+                let base = woff[w] + (a + bi) * per_pv;
+                let alive = |j: usize| {
+                    let g = base + j;
+                    (kill[g >> 6].load(Ordering::Relaxed) >> (g & 63)) & 1 == 0
+                };
+                for (j, r) in sl.iter().enumerate() {
+                    if j + PF < sl.len() {
+                        links.prefetch(sl[j + PF].pk);
+                    }
+                    if !alive(j) {
+                        continue;
+                    }
+                    let pk = links.person(r.pk);
+                    st.ev[((h128(pk) >> 40) & pmask) as usize].push(&mut st.ar, PRec { pk, ts: r.ts, price: r.price, cat: r.cat });
+                }
+                st.ar.free.push(sl.as_ptr() as *mut u8);
+            }
+            st.t_map += tcpu() - tt;
+        },
+    );
     {
         let n: usize = p2.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
-        let a: f64 = p2.iter().map(|s| s.t_dd).sum();
+        let a: f64 = p2c.iter().map(|s| s.t_dd).sum();
         let b: f64 = p2.iter().map(|s| s.t_map).sum();
-        let c: f64 = p2.iter().map(|s| s.t_cl).sum();
-        log(&format!("dedup: {} surviving events (thread-s: dedup {:.2}, event person map {:.2}, click person map {:.2})", n, a, b, c));
+        let c: f64 = p2c.iter().map(|s| s.t_cl).sum();
+        let kills: usize = p2c.iter().map(|s| s.kills).sum();
+        let winners: usize = p2c.iter().map(|s| s.winners).sum();
+        let vw: usize = p2c.iter().map(|s| s.valid_winners).sum();
+        let copies: usize = p1.iter().map(|s| s.dd.iter().map(|v| v.len()).sum::<usize>()).sum();
+        // invariants: every valid copy is either the kept winner or killed; every copy is a winner or a loser
+        let ok = nvalid == vw + kills && n == vw && copies >= winners;
+        log(&format!(
+            "dedup: {} surviving events (thread-s: dedup {:.2}, event person map {:.2}, click person map {:.2}); copies {} winners {} valid winners {} kills {} valid copies {} invariant {}",
+            n, a, b, c, copies, winners, vw, kills, nvalid, if ok { "OK" } else { "FAIL" }
+        ));
         log(&format!("links: {} ids", links_wait().n));
     }
 
@@ -1422,7 +1662,7 @@ fn main() {
             // clicks of persons with events
             let mut ccnt = vec![0u32; npers + 1];
             let mut cp: Vec<u32> = Vec::new();
-            for s in p2.iter() {
+            for s in p2c.iter() {
                 for r in s.cl[q].iter() {
                     let pid = match tab.find(h128(r.pk), |&i| names[i as usize] == r.pk) {
                         Some(&i) => i,
@@ -1441,7 +1681,7 @@ fn main() {
             let mut cpos = coff.clone();
             let mut cks: Vec<Ck> = vec![Ck { ts: 0, cid: 0, camp: 0 }; coff[npers]];
             let mut k = 0;
-            for s in p2.iter() {
+            for s in p2c.iter() {
                 for r in s.cl[q].iter() {
                     let pid = cp[k];
                     k += 1;
@@ -1874,6 +2114,16 @@ mod tests {
         assert!(n > 10000);
         for &sd in &seeds {
             assert_eq!(parse_ts_fast(sd), parse_ts(sd));
+        }
+    }
+    #[test]
+    fn days_fast_matches() {
+        for y in [-5i64, 0, 1, 1899, 1900, 1970, 2000, 2024, 2028, 2100, 2299, 2300, 9999] {
+            for m in 0..=13 {
+                for d in 0..=32 {
+                    assert_eq!(days_fast(y, m, d), days_from_civil(y, m, d), "{} {} {}", y, m, d);
+                }
+            }
         }
     }
     #[test]
