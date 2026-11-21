@@ -1,6 +1,6 @@
 # Shopping Sessions: native Rust pipeline design
 
-Code: `src/main.rs` (one file, about 1,100 lines). Submission root: `../rust-app/`. Run `sh sync.sh` there to copy the sources over; it uses a multi-stage Dockerfile.
+Code: `src/main.rs` (one file). The text below was measured at v5; the "Changes in a11" section lists what a11 changed on top of it. Submission root: `../rust-app/`. Run `sh sync.sh` there to copy the sources over; it uses a multi-stage Dockerfile.
 
 ## Measurements
 
@@ -36,6 +36,18 @@ The host was shared with other jobs, at a load of 15 to 24 on 24 logical CPUs. T
 | v1 | String slices, buckets grown by `Vec` doubling | 3.65 s |
 | v3 | Packed u128 ID keys; buckets pre-sized; compact link table | 1.8 s |
 | v5 | Dedup table holds the records; prefetching; `process::exit` | 1.59 s |
+
+## Changes in a11 (on top of v5)
+
+Same pipeline and the same output; only how each stage does its work changed. Where a stage below differs, a11 wins over the v5 text.
+
+- **Hugepage arenas.** Buckets, scatter buffers and the link table live in 2 MB-aligned anonymous regions with `MADV_HUGEPAGE`, bump-allocated in 16 KB blocks. Consumed blocks are recycled into the next scatter phase, and the arenas are unmapped in parallel at exit. This cuts page faults (about 823k to 157k) and page-zeroing time.
+- **SIMD tokenizer.** On AVX2 builds, 128-byte comma, quote and newline masks give field boundaries and the quote check without a per-byte branch. Lines of 128 bytes or more, and lines near the end of a file, use the scalar splitter. Unit tests compare both paths.
+- **u64 packed IDs.** An ID of up to 10 bytes over `[-0-9A-Za-z_]` is packed order-preserving into a u64 (6 bits per byte). Byte-wise order and equality carry over to the integers. Any other ID goes through a mutex interner as a fallback. Event records shrink from 64 to 40 bytes, and the link slots from 32 to 16.
+- **SWAR timestamps.** `ts` and `ingest_ts` in the standard 20-byte `...Z` shape are parsed with 8-byte SWAR loads. Any other shape falls back to the full validating parser.
+- **No link wait.** Parsing and deduplication start without waiting for the link table. The link thread publishes it, and only the person-mapping step reads it (with software prefetch).
+
+Build: `-C target-cpu=x86-64-v3` (AVX2, no AVX-512 instruction in the binary). The Dockerfile pins the toolchain and base image digests.
 
 ## Stages
 

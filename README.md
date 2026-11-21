@@ -4,12 +4,14 @@ A single static-ish Rust binary (`src/main.rs`) that reads the event, click, lin
 
 Pipeline, all multi-threaded over memory-mapped input:
 
-1. Parse events and clicks with a byte-level tokenizer (the rules guarantee no commas, quotes or newlines inside values, so any newline is a safe split point).
-2. Resolve identities with union-find over links, overlapped with parsing; each person is named by the byte-wise smallest user id.
+1. Parse events and clicks with an AVX2 mask tokenizer, packing IDs into u64 and parsing timestamps with SWAR (the rules guarantee no commas, quotes or newlines inside values, so any newline is a safe split point).
+2. Resolve identities with union-find over links, overlapped with parsing and not waited on by it; each person is named by the byte-wise smallest user id.
 3. Deduplicate events, keeping the minimum `ingest_ts`.
 4. Group by person, sort, and sessionize with a 30-minute gap (equal timestamps share a session).
 5. Credit purchases and count assists within the 7-day attribution window.
 6. Write both Parquet tables.
+
+Large buffers are 2 MB-aligned hugepage arenas. The binary is built for x86-64-v3 (AVX2) and needs no AVX-512.
 
 `DESIGN.md` explains each stage: the alternatives considered, the chosen approach, its lower bound and the measured time.
 
