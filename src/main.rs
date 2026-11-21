@@ -37,7 +37,9 @@ fn hs(s: &[u8]) -> u64 {
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn log(msg: &str) {
     let t = T0.get().unwrap().elapsed().as_secs_f64();
-    eprintln!("[{:8.3}s] {} (minflt {})", t, msg, minflt());
+    // never panic on a closed or broken stderr
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "[{:8.3}s] {} (minflt {})", t, msg, minflt());
 }
 
 /// CPU seconds consumed by the calling thread (load-insensitive stage timing).
@@ -1263,13 +1265,21 @@ fn main() {
         np = v; // knob for A/B only
     }
     let pmask = (np - 1) as u64;
+    // user partitions for the ID->person join: each partition's slice of the link table should
+    // stay cache resident; fewer partitions mean fewer scatter streams while parsing
+    // (knob race at load ~11: 128 vs 512 within noise, so it stays equal to np)
+    let mut npu = np;
+    if let Some(v) = std::env::var("NPU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| v.is_power_of_two()) {
+        npu = v; // knob for A/B only
+    }
+    let umask = (npu - 1) as u64;
     log(&format!("{} event, {} click, {} link files, {} MB, {} threads, {} partitions", ev_files.len(), cl_files.len(), lk_files.len(), total >> 20, nt, np));
 
     // ---------------------------------------------------------- links (own thread, overlaps parsing)
     // the link table is published through LINKS; phase 2 starts deduplicating without it
     // and only the person-map steps wait for it
     std::thread::spawn(move || {
-        let l = build_links(&lk_files, np);
+        let l = build_links(&lk_files, npu);
         let _ = LINKS.set(l);
         let _g = LK_M.lock().unwrap();
         LK_CV.notify_all();
@@ -1353,7 +1363,7 @@ fn main() {
             ar: Arena::new(reg1),
             dd: (0..npd).map(|_| Bkt::new()).collect(),
             ddl: (0..npd).map(|_| Bkt::new()).collect(),
-            pv: (0..np).map(|_| Bkt::new()).collect(),
+            pv: (0..npu).map(|_| Bkt::new()).collect(),
             cl: Bkt::new(),
             t_ev: 0.0,
             t_cl: 0.0,
@@ -1414,7 +1424,7 @@ fn main() {
                     }
                     let _ = lim;
                     let loc = if ts != BAD {
-                        let q = ((h128(ukey) >> 40) & pmask) as usize;
+                        let q = ((h128(ukey) >> 40) & umask) as usize;
                         let l = (st.w << 56) | ((q as u64) << 40) | st.pv[q].len() as u64;
                         st.pv[q].push(&mut st.ar, PRec { pk: ukey, ts, price, cat });
                         l
@@ -1479,17 +1489,17 @@ fn main() {
         }
     }
     // global index of valid copy (worker w, user partition q, index i) = off[w * np + q] + i
-    let mut off: Vec<usize> = vec![0; p1.len() * np + 1];
+    let mut off: Vec<usize> = vec![0; p1.len() * npu + 1];
     for (w, s) in p1.iter().enumerate() {
-        for q in 0..np {
-            off[w * np + q + 1] = off[w * np + q] + s.pv[q].len();
+        for q in 0..npu {
+            off[w * npu + q + 1] = off[w * npu + q] + s.pv[q].len();
         }
     }
-    let nvalid = off[p1.len() * np];
+    let nvalid = off[p1.len() * npu];
     let kill: Vec<std::sync::atomic::AtomicU64> = (0..(nvalid + 63) / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let kill_loc = |loc: u64| {
         if loc != NOLOC {
-            let g = off[(loc >> 56) as usize * np + ((loc >> 40) & 0xFFFF) as usize] + (loc & ((1 << 40) - 1)) as usize;
+            let g = off[(loc >> 56) as usize * npu + ((loc >> 40) & 0xFFFF) as usize] + (loc & ((1 << 40) - 1)) as usize;
             kill[g >> 6].fetch_or(1 << (g & 63), Ordering::Relaxed);
         }
     };
@@ -1639,7 +1649,7 @@ fn main() {
     let reg2 = Region::new(ev_bytes / 40 * std::mem::size_of::<PRec>() + nt * ((np + 2) * BLK_BYTES + SLAB));
     let p2 = par(
         nt,
-        np,
+        npu,
         |_| new_p2(reg2),
         |st, q| {
             let tt = tcpu();
@@ -1672,7 +1682,7 @@ fn main() {
                 }
             };
             for (w, s) in p1.iter().enumerate() {
-                let o = off[w * np + q];
+                let o = off[w * npu + q];
                 for (bi, sl) in s.pv[q].slices().enumerate() {
                     let base = o + bi * per_pv;
                     for (j, r) in sl.iter().enumerate() {
