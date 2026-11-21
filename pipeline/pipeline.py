@@ -233,9 +233,11 @@ con.execute(f"""CREATE TABLE evv AS
 log("events validated")
 
 # ---------------------------------------------------------------- sessionize
+# RANGE (not ROWS) frame: rows with equal ts are peers and get the same running
+# sum, so all events sharing a ts join one session (R-EV.5) whatever their order.
 con.execute(f"""CREATE TABLE evs AS
     SELECT person, ts, price, is_purchase, category,
-           sum(CASE WHEN ts - pts > {GAP} THEN 1 ELSE 0 END) OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING) AS sid
+           sum(CASE WHEN ts - pts > {GAP} THEN 1 ELSE 0 END) OVER (PARTITION BY person ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sid
     FROM (SELECT *, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS pts FROM evv)""")
 con.execute(f"""CREATE TABLE sess AS
     SELECT person, sid, min(ts) AS start, (min(ts) // {DAY}) AS dayn, count(*) AS n_events,
@@ -285,7 +287,7 @@ skeys = np.asarray(skeys, dtype=np.int64)
 isl = con.execute(f"""
     WITH c AS (SELECT pid.p, clv.campaign_id, clv.ts FROM clv JOIN pid USING (person)),
          g AS (SELECT p, campaign_id, ts,
-                      sum(CASE WHEN ts - pts > {WEEK} THEN 1 ELSE 0 END) OVER (PARTITION BY p, campaign_id ORDER BY ts ROWS UNBOUNDED PRECEDING) AS gi
+                      sum(CASE WHEN ts - pts > {WEEK} THEN 1 ELSE 0 END) OVER (PARTITION BY p, campaign_id ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS gi
                FROM (SELECT *, lag(ts) OVER (PARTITION BY p, campaign_id ORDER BY ts) AS pts FROM c)),
          i AS (SELECT p, campaign_id, greatest(min(ts), {W0}) AS a, least(max(ts) + {WEEK}, {W1 - 1}) AS b
                FROM g GROUP BY p, campaign_id, gi),
