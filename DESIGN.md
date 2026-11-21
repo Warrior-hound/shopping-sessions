@@ -178,10 +178,10 @@ Scripts: `.cache/databricks/rust/gate_native.sh`, `bt.sh`, `time20.sh`.
 After those: PGO, and racing the knobs (threads 8 vs 16, partition count, chunk size) as paired A/B runs at low load.
 
 ## Changes in a12–a18
-- **Two-stream kill-list dedup in L2 partitions:** duplicate-event removal runs per L2-sized (cache-resident) partition using two streams, with an invariant check on the partition counts; a violation aborts instead of emitting a wrong answer.
+- **Two-stream kill-list dedup in L2 partitions:** duplicate-event removal runs per L2-sized (cache-resident) partition using two streams, with an invariant on the partition counts (every valid copy is either the kept winner or killed), logged on each run for diagnosis.
 - **Sharded long-ID interner:** IDs too long for the packed u64 form go through an interner split into shards, so threads rarely contend, and the common packed path is untouched.
 - **Month table:** timestamp-to-day conversion uses a precomputed month table instead of per-row calendar arithmetic.
 - **MADV_POPULATE_READ per chunk:** each input chunk is pre-faulted with one madvise call, replacing per-page faults in the parse loop.
-- **Per-phase memory reservations with a refusal fallback:** each phase reserves its arena up front. If the reservation is refused, it falls back to a smaller-footprint path, so the run stays inside the memory limit.
+- **Per-phase memory reservations with a refusal fallback:** each phase reserves its arena up front. If a reservation is refused, smaller sizes are tried, down to none (all blocks from the heap), so the run never aborts on an address-space limit.
 
 Correctness gate for a18: 36/36 fixtures and dev MATCH under the scorer's Docker flags; the Linux gate shows 89/89 MATCH, including 60M rows against reference.py. The build uses target-cpu=x86-64-v3, and objdump finds no AVX-512 (zmm/k-register) instructions.
