@@ -39,7 +39,25 @@ fn log(msg: &str) {
     let t = T0.get().unwrap().elapsed().as_secs_f64();
     // never panic on a closed or broken stderr
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "[{:8.3}s] {} (minflt {})", t, msg, minflt());
+    if TL.load(Ordering::Relaxed) {
+        // TIMELINE=1: absolute CLOCK_REALTIME stamp (epoch ms) shared with host-side stamps
+        let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let _ = writeln!(std::io::stderr(), "TL {:.3} [{:8.3}s] {} (minflt {})", e, t, msg, minflt());
+    } else if DIAGF.load(Ordering::Relaxed) {
+        // DIAG=1: resident set size at each log point
+        let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|v| v.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok())).unwrap_or(0) * 4096;
+        let _ = writeln!(std::io::stderr(), "[{:8.3}s] {} (minflt {}, rss {} MB)", t, msg, minflt(), rss >> 20);
+    } else {
+        let _ = writeln!(std::io::stderr(), "[{:8.3}s] {} (minflt {})", t, msg, minflt());
+    }
+}
+static DIAGF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A timeline-only log point (TIMELINE=1); default output unchanged.
+fn tlog(msg: &str) {
+    if TL.load(Ordering::Relaxed) {
+        log(msg);
+    }
 }
 
 /// CPU seconds consumed by the calling thread (load-insensitive stage timing).
@@ -1245,6 +1263,7 @@ fn read_exact_at(f: &std::fs::File, buf: &mut [u8], off: usize) {
 }
 
 /// A worker's reusable read buffer (leaked; grown only for lines longer than the slack).
+static FIRST_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 struct RdBuf {
     p: *mut u8,
     cap: usize,
@@ -1268,6 +1287,9 @@ impl RdBuf {
                 *self = RdBuf::new((want + RD_PAD) * 2);
             }
             let b = unsafe { std::slice::from_raw_parts_mut(self.p, want) };
+            if TL.load(Ordering::Relaxed) && !FIRST_READ.swap(true, Ordering::Relaxed) {
+                tlog("first pread");
+            }
             read_exact_at(&f.f, b, rs);
             // every line starting before e ends at the first '\n' at or after e - 1
             if rs + want == f.len || memchr::memchr(b'\n', &b[e - 1 - rs..]).is_some() {
@@ -1544,6 +1566,13 @@ fn id_cmp(a: K, b: K) -> std::cmp::Ordering {
     bytes(a, &mut x).cmp(bytes(b, &mut y))
 }
 
+/// Partition hash: bits 40.. pick a partition (one multiply; the tables inside a partition
+/// probe with the independent `h128`).
+#[inline(always)]
+fn ph(k: K) -> u64 {
+    (k ^ (k >> 31)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 #[inline]
 fn h128(k: K) -> u64 {
     let m = ((k ^ 0x243f_6a88_85a3_08d3) as u128) * 0x9e37_79b9_7f4a_7c15u128;
@@ -1812,7 +1841,7 @@ fn build_links(lk_files: &[S], np: usize) -> Links {
     let mut parts: Vec<Vec<(K, K)>> = vec![Vec::new(); np];
     for &e in t.iter() {
         if e.0 != 0 {
-            parts[((h128(e.0) >> 40) as usize) & (np - 1)].push(e);
+            parts[((ph(e.0) >> 40) as usize) & (np - 1)].push(e);
         }
     }
     Links { tab: t, mask, n, parts }
@@ -1846,6 +1875,9 @@ fn flush(rows: &mut URows, name: K, day: i64, ses: i64, ev: i64, rev: i64, catsu
 }
 
 fn main() {
+    T0.set(Instant::now()).ok();
+    TL.store(std::env::var_os("TIMELINE").is_some(), Ordering::Relaxed);
+    tlog("main entry");
     if std::env::var_os("WIDE").is_some() || !main_fast() {
         main_wide();
     }
@@ -1853,6 +1885,7 @@ fn main() {
 
 fn main_fast() -> bool {
     T0.set(Instant::now()).ok();
+    DIAGF.store(std::env::var_os("DIAG").is_some(), Ordering::Relaxed);
     let args: Vec<String> = std::env::args().collect();
     let (data, out) = if args.len() >= 3 {
         (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
@@ -1895,8 +1928,9 @@ fn main_fast() -> bool {
     let pmask = (np - 1) as u64;
     // user partitions for the ID->person join: each partition's slice of the link table should
     // stay cache resident; fewer partitions mean fewer scatter streams while parsing
-    // (knob race at load ~11: 128 vs 512 within noise, so it stays equal to np)
-    let mut npu = np;
+    // np / 4: fewer scatter streams while parsing (NPU sweep 512/128/64/32 at 20M: 128 best, parse
+    // -6%); each partition's link table (~2 x ids / npu x 16 B, ~0.3 MB at 20M) still fits a 1 MB L2
+    let mut npu = (np / 4).max(64);
     if let Some(v) = std::env::var("NPU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| v.is_power_of_two()) {
         npu = v; // knob for A/B only
     }
@@ -1976,7 +2010,7 @@ fn main_fast() -> bool {
         ddw: Vec<Bkt<DRec>>, // packed event_ids whose ingest / locator do not fit DRec16 (same partitions)
         ddl: Vec<Bkt<DRecL>>, // same for event_ids that do not pack (empty for generator data)
         pv: Vec<Bkt<PRec16>>, // valid copies, by hash(user key) partition (np partitions)
-        cl: Bkt<CRec24>,
+        cl: Vec<Bkt<CRec24>>, // valid clicks, by hash(user key) partition (npu partitions, as pv)
         dl: Vec<Line>, // write-combining staging lines of dd / pv
         pl: Vec<Line>,
         buf: RdBuf,
@@ -2015,7 +2049,11 @@ fn main_fast() -> bool {
     }
     let ibase: i64 = w0.div_euclid(1000) - (1i64 << 31);
     let ra: usize = std::env::var("RA").ok().and_then(|v| v.parse().ok()).unwrap_or(nt);
-    let idk_in = |s: S, lim: usize| if rd { idkf_own(s, lim) } else { idkf(s, lim) };
+    #[inline(always)]
+    fn idk_rd(rd: bool, s: S, lim: usize) -> K {
+        if rd { idkf_own(s, lim) } else { idkf(s, lim) }
+    }
+    let idk_in = |s: S, lim: usize| idk_rd(rd, s, lim);
     let p1 = par(
         nt,
         ne + cch.len(),
@@ -2026,7 +2064,7 @@ fn main_fast() -> bool {
             ddw: (0..npd).map(|_| Bkt::new()).collect(),
             ddl: (0..npd).map(|_| Bkt::new()).collect(),
             pv: (0..npu).map(|_| Bkt::new()).collect(),
-            cl: Bkt::new(),
+            cl: (0..npu).map(|_| Bkt::new()).collect(),
             dl: vec![Line([0; 64]); npd],
             pl: vec![Line([0; 64]); npu],
             buf: RdBuf::new(if rd { ch + (64 << 10) } else { 0 }),
@@ -2108,7 +2146,7 @@ fn main_fast() -> bool {
                     }
                     let _ = lim;
                     let (loc, l32) = if ts != BAD {
-                        let q = ((h128(ukey) >> 40) & umask) as usize;
+                        let q = ((ph(ukey) >> 40) & umask) as usize;
                         let idx = st.pv[q].len() as u64;
                         let l = (st.w << 56) | ((q as u64) << 40) | idx;
                         st.pv[q].push_wc(&mut st.pl[q], &mut st.ar, PRec16 { pk: ukey, ts: (ts - cw0) as u32, pc });
@@ -2118,7 +2156,7 @@ fn main_fast() -> bool {
                     };
                     match pack16(f[0], lim) {
                         Some(key) => {
-                            let h = h128(key);
+                            let h = ph(key);
                             let isec = ing.div_euclid(1000) - ibase;
                             if ing.rem_euclid(1000) == 0 && (0..u32::MAX as i64).contains(&isec) && (loc == NOLOC || l32 != NOLOC32) {
                                 let b = ((h >> 40) & dmask) as usize;
@@ -2175,7 +2213,9 @@ fn main_fast() -> bool {
                         Some(&i) => i,
                         None => return,
                     };
-                    st.cl.push(&mut st.ar, CRec24 { pk: idk_in(f[1], lim), cid: idk_in(f[0], lim), ts: (ts - cw0) as u32, camp });
+                    let pk = idk_in(f[1], lim);
+                    let q = ((ph(pk) >> 40) & umask) as usize;
+                    st.cl[q].push(&mut st.ar, CRec24 { pk, cid: idk_in(f[0], lim), ts: (ts - cw0) as u32, camp });
                 });
                 st.t_cl += tcpu() - tt;
             }
@@ -2194,7 +2234,7 @@ fn main_fast() -> bool {
     let p1 = p1;
     {
         let ne: usize = p1.iter().map(|s| (s.dd.iter().map(|v| v.len()).sum::<usize>() + s.ddw.iter().map(|v| v.len()).sum::<usize>() + s.ddl.iter().map(|v| v.len()).sum::<usize>())).sum();
-        let nc: usize = p1.iter().map(|s| s.cl.len()).sum();
+        let nc: usize = p1.iter().map(|s| s.cl.iter().map(|v| v.len()).sum::<usize>()).sum();
         let te: f64 = p1.iter().map(|s| s.t_ev).sum();
         let tc: f64 = p1.iter().map(|s| s.t_cl).sum();
         log(&format!("parsed: {} event copies ({:.2} thread-s), {} valid clicks ({:.2} thread-s)", ne, te, nc, tc));
@@ -2205,16 +2245,6 @@ fn main_fast() -> bool {
     // kill bit of every other copy that has a valid-copy record. Click tasks (person map +
     // scatter) run in the same pass. Phase 2b: stream the valid copies, skip killed ones, map
     // to persons and scatter by hash(person).
-    const CSLB: usize = 64; // blocks per stream task
-    let cl_slices: Vec<Vec<&[CRec24]>> = p1.iter().map(|s| s.cl.slices().collect()).collect();
-    let mut ctasks: Vec<(usize, usize)> = Vec::new();
-    for (w, s) in cl_slices.iter().enumerate() {
-        let mut a = 0;
-        while a < s.len() {
-            ctasks.push((w, a));
-            a += CSLB;
-        }
-    }
     // global index of valid copy (worker w, user partition q, index i) = off[w * np + q] + i
     let mut off: Vec<usize> = vec![0; p1.len() * npu + 1];
     for (w, s) in p1.iter().enumerate() {
@@ -2235,6 +2265,7 @@ fn main_fast() -> bool {
         ev: Vec<Bkt<PRec16>>,
         cl: Vec<Bkt<CRec24>>,
         tab: Vec<DRec>,
+        tab16: Vec<DRec16>,
         el: Vec<Line>,
         kills: usize,
         winners: usize,
@@ -2248,6 +2279,7 @@ fn main_fast() -> bool {
         ev: (0..np).map(|_| Bkt::new()).collect(),
         cl: (0..np).map(|_| Bkt::new()).collect(),
         tab: Vec::new(),
+        tab16: Vec::new(),
         el: Vec::new(),
         kills: 0,
         winners: 0,
@@ -2256,14 +2288,64 @@ fn main_fast() -> bool {
         t_map: 0.0,
         t_cl: 0.0,
     };
-    let reg2c = Region::new(cl_bytes / 30 * std::mem::size_of::<CRec24>() + nt * ((np + 2) * BLK_BYTES + SLAB));
-    let p2c = par(
+    let reg2c = Region::new(64 << 20); // 2a pushes nothing; its arenas only collect consumed blocks
+    let mut p2c = par(
         nt,
-        npd + ctasks.len(),
+        npd,
         |_| new_p2(reg2c),
         |st, p| {
             let tt = tcpu();
             if p < npd {
+                let (mut kills, mut winners, mut valid_winners) = (0usize, 0usize, 0usize);
+                let ilm = (1u64 << ib) - 1;
+                let qm = (1u64 << qb) - 1;
+                let wloc = |l: u32| if l == NOLOC32 { NOLOC } else {
+                    let l = l as u64;
+                    ((l >> (qb + ib)) << 56) | (((l >> ib) & qm) << 40) | (l & ilm)
+                };
+                let wide = |r: &DRec16| DRec { key: r.key, ing: (r.ing as i64 + ibase) * 1000, loc: wloc(r.loc) };
+                let capw: usize = p1.iter().map(|s| s.ddw[p].len()).sum();
+                if capw == 0 {
+                    // every copy of this partition is compact: a 16-byte-slot table (ingest
+                    // seconds order the same way as ms, since all of them are whole seconds)
+                    let cap: usize = p1.iter().map(|s| s.dd[p].len()).sum();
+                    let mut sz = 16usize;
+                    while sz < cap * 2 {
+                        sz *= 2;
+                    }
+                    let mask = sz - 1;
+                    st.tab16.clear();
+                    st.tab16.resize(sz, DRec16 { key: 0, ing: 0, loc: 0 });
+                    let tab = &mut st.tab16;
+                    for s in p1.iter() {
+                        for r in s.dd[p].iter() {
+                            let mut i = (h128(r.key) >> 8) as usize & mask;
+                            loop {
+                                let e = &mut tab[i];
+                                if e.key == r.key {
+                                    if r.ing < e.ing {
+                                        kills += (e.loc != NOLOC32) as usize;
+                                        kill_loc(wloc(e.loc));
+                                        valid_winners -= (e.loc != NOLOC32) as usize;
+                                        valid_winners += (r.loc != NOLOC32) as usize;
+                                        *e = *r;
+                                    } else {
+                                        kills += (r.loc != NOLOC32) as usize;
+                                        kill_loc(wloc(r.loc));
+                                    }
+                                    break;
+                                }
+                                if e.key == 0 {
+                                    *e = *r;
+                                    winners += 1;
+                                    valid_winners += (r.loc != NOLOC32) as usize;
+                                    break;
+                                }
+                                i = (i + 1) & mask;
+                            }
+                        }
+                    }
+                } else {
                 let cap: usize = p1.iter().map(|s| s.dd[p].len() + s.ddw[p].len()).sum();
                 let mut sz = 16usize;
                 while sz < cap * 2 {
@@ -2273,19 +2355,6 @@ fn main_fast() -> bool {
                 st.tab.clear();
                 st.tab.resize(sz, DRec { key: 0, ing: 0, loc: 0 }); // key 0 = empty slot (empty event_ids are dropped)
                 let tab = &mut st.tab;
-                let (mut kills, mut winners, mut valid_winners) = (0usize, 0usize, 0usize);
-                let ilm = (1u64 << ib) - 1;
-                let qm = (1u64 << qb) - 1;
-                let wide = |r: &DRec16| DRec {
-                    key: r.key,
-                    ing: (r.ing as i64 + ibase) * 1000,
-                    loc: if r.loc == NOLOC32 {
-                        NOLOC
-                    } else {
-                        let l = r.loc as u64;
-                        ((l >> (qb + ib)) << 56) | (((l >> ib) & qm) << 40) | (l & ilm)
-                    },
-                };
                 for s in p1.iter() {
                     for r in s.dd[p].iter().map(wide).chain(s.ddw[p].iter().copied()) {
                         let r = &r;
@@ -2315,6 +2384,7 @@ fn main_fast() -> bool {
                             i = (i + 1) & mask;
                         }
                     }
+                }
                 }
                 // event_ids that do not pack: same rule, hash match confirmed byte for byte
                 let capl: usize = p1.iter().map(|s| s.ddl[p].len()).sum();
@@ -2367,35 +2437,23 @@ fn main_fast() -> bool {
                     s.ddw[p].recycle_into(&mut st.ar);
                 }
                 st.t_dd += tcpu() - tt;
-            } else {
-                let (w, a) = ctasks[p - npd];
-                let links = links_wait();
-                let v = &cl_slices[w];
-                for sl in &v[a..(a + CSLB).min(v.len())] {
-                    for (j, r) in sl.iter().enumerate() {
-                        if j + PF < sl.len() {
-                            links.prefetch(sl[j + PF].pk);
-                        }
-                        let pk = links.person(r.pk);
-                        st.cl[((h128(pk) >> 40) & pmask) as usize].push(&mut st.ar, CRec24 { pk, ..*r });
-                    }
-                    // this click block is consumed (each block belongs to exactly one task)
-                    st.ar.free.push(sl.as_ptr() as *mut u8);
-                }
-                st.t_cl += tcpu() - tt;
             }
         },
     );
+    if DIAGF.load(Ordering::Relaxed) { log("phase 2a done (dedup)"); } else { tlog("phase 2a done (dedup)"); }
     // phase 2b: per user partition, join its valid copies against that partition's links
     // (a small table, cache resident), skip killed copies, scatter by hash(person)
     let per_pv = BLK_BYTES / std::mem::size_of::<PRec16>();
-    let reg2 = Region::new(ev_bytes / 40 * std::mem::size_of::<PRec16>() + nt * ((np + 2) * BLK_BYTES + SLAB));
+    let reg2 = Region::new(ev_bytes / 40 * std::mem::size_of::<PRec16>() + cl_bytes / 30 * std::mem::size_of::<CRec24>() + nt * ((2 * np + 2) * BLK_BYTES + SLAB));
+    // the dedup blocks consumed in phase 2a are already faulted in: phase 2b writes into them first
+    let pool: std::sync::Mutex<Vec<Vec<usize>>> = std::sync::Mutex::new(p2c.iter_mut().map(|s| std::mem::take(&mut s.ar.free).into_iter().map(|p| p as usize).collect()).collect());
     let p2 = par(
         nt,
         npu,
         |_| {
             let mut s = new_p2(reg2);
             s.el = vec![Line([0; 64]); np];
+            s.ar.free = pool.lock().unwrap().pop().unwrap_or_default().into_iter().map(|p| p as *mut u8).collect();
             s
         },
         |st, q| {
@@ -2438,14 +2496,23 @@ fn main_fast() -> bool {
                             continue;
                         }
                         let pk = person(r.pk);
-                        let b = ((h128(pk) >> 40) & pmask) as usize;
+                        let b = ((ph(pk) >> 40) & pmask) as usize;
                         st.ev[b].push_wc(&mut st.el[b], &mut st.ar, PRec16 { pk, ..*r });
                     }
                 }
                 s.pv[q].recycle_into(&mut st.ar);
             }
             sfence();
-            st.t_map += tcpu() - tt;
+            let t1 = tcpu();
+            st.t_map += t1 - tt;
+            for s in p1.iter() {
+                for r in s.cl[q].iter() {
+                    let pk = person(r.pk);
+                    st.cl[((ph(pk) >> 40) & pmask) as usize].push(&mut st.ar, CRec24 { pk, ..*r });
+                }
+                s.cl[q].recycle_into(&mut st.ar);
+            }
+            st.t_cl += tcpu() - t1;
         },
     );
     let mut p2 = p2;
@@ -2460,7 +2527,7 @@ fn main_fast() -> bool {
         let n: usize = p2.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
         let a: f64 = p2c.iter().map(|s| s.t_dd).sum();
         let b: f64 = p2.iter().map(|s| s.t_map).sum();
-        let c: f64 = p2c.iter().map(|s| s.t_cl).sum();
+        let c: f64 = p2.iter().map(|s| s.t_cl).sum();
         let kills: usize = p2c.iter().map(|s| s.kills).sum();
         let winners: usize = p2c.iter().map(|s| s.winners).sum();
         let vw: usize = p2c.iter().map(|s| s.valid_winners).sum();
@@ -2586,7 +2653,7 @@ fn main_fast() -> bool {
             ccnt.resize(npers, 0);
             let cp = pids;
             cp.clear();
-            for s in p2c.iter() {
+            for s in p2.iter() {
                 for r in s.cl[q].iter() {
                     let pid = match tab.find(h128(r.pk), |&i| names[i as usize] == r.pk) {
                         Some(&i) => i,
@@ -2613,7 +2680,7 @@ fn main_fast() -> bool {
             cks.reserve(coff[npers]);
             unsafe { cks.set_len(coff[npers]) };
             let mut k = 0;
-            for s in p2c.iter() {
+            for s in p2.iter() {
                 for r in s.cl[q].iter() {
                     let pid = cp[k];
                     k += 1;
@@ -2635,6 +2702,7 @@ fn main_fast() -> bool {
             let gap = GAP as u32;
             let week = WEEK as u32;
             let mut starts: Vec<i64> = Vec::new();
+            let mut sdays: Vec<u32> = Vec::new(); // day index of each session start
             let mut catsum: Vec<(u32, i64)> = Vec::new();
             let mut open: Vec<(u32, u32, u32, u32)> = Vec::new(); // (campaign, island start, island end, pad)
             let mut closed: Vec<(u32, u32, u32, u32)> = Vec::new();
@@ -2643,6 +2711,7 @@ fn main_fast() -> bool {
                 let c = &cks[coff[pid]..coff[pid + 1]];
                 let name = names[pid];
                 starts.clear();
+                sdays.clear();
                 // user_daily accumulators for the current day
                 let mut cur_day = i64::MIN;
                 let (mut d_ses, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
@@ -2687,6 +2756,7 @@ fn main_fast() -> bool {
                     d_ev += (j - i) as i64;
                     d_rev += rev;
                     starts.push(start);
+                    sdays.push((day - day0) as u32);
                     // credit: latest click with ts <= start (clicks sorted by ts, then click_id)
                     while hi < c.len() && c[hi].ts <= start32 {
                         hi += 1;
@@ -2743,13 +2813,9 @@ fn main_fast() -> bool {
                         let (a, b) = (a32 as i64 + cw0, b32 as i64 + cw0);
                         let lo = starts.partition_point(|&s| s < a);
                         let hi = starts.partition_point(|&s| s <= b + WEEK);
-                        let mut x = lo;
-                        while x < hi {
-                            let d = starts[x].div_euclid(DAY);
-                            let nb = (d + 1) * DAY;
-                            let y = x + starts[x..hi].partition_point(|&s| s < nb);
-                            st.acc[camp as usize * ndays + (d - day0) as usize][3] += (y - x) as i64;
-                            x = y;
+                        let row = &mut st.acc[camp as usize * ndays..(camp as usize + 1) * ndays];
+                        for &d in &sdays[lo..hi] {
+                            row[d as usize][3] += 1;
                         }
                     }
                     closed.clear();
@@ -2784,6 +2850,7 @@ fn main_fast() -> bool {
     // narrowest integer width that holds every value of the table (same type in every file)
     let fits = |f: &dyn Fn(&URows) -> &Vec<i64>| p3.iter().all(|s| f(&s.rows).iter().all(|&x| x >= i32::MIN as i64 && x <= i32::MAX as i64));
     let w32 = [fits(&|r| &r.ses), fits(&|r| &r.ev), fits(&|r| &r.rev)];
+    tlog("write start");
     std::thread::scope(|sc| {
         for (k, &i) in nonempty.iter().enumerate() {
             let r = &p3[i].rows;
@@ -2803,10 +2870,14 @@ fn main_fast() -> bool {
                 }
             }
         }
-        write_campaign(&cd.join("part-00000.parquet"), &rows);
+        if rows.is_empty() {
+            write_campaign(&cd.join("part-00000.parquet"), &rows);
+        } else {
+            write_campaign_raw(&cd.join("part-00000.parquet"), &rows);
+        }
         log(&format!("campaign_daily {} rows", rows.len()));
     });
-    log(&format!("done: user_daily {} rows", nrows));
+    log(&format!("done: user_daily {} rows (zstd cpu {:.1} ms)", nrows, ZNS.load(Ordering::Relaxed) as f64 / 1e6));
     if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
         if let Some(l) = st.lines().find(|l| l.starts_with("VmHWM")) {
             log(l);
@@ -2831,6 +2902,7 @@ fn main_fast() -> bool {
         parallel_teardown(nt, &inputs);
         log("teardown");
     }
+    tlog("exit");
     std::process::exit(0);
 }
 
@@ -3029,7 +3101,7 @@ fn main_wide() {
                     }
                     let _ = lim;
                     let loc = if ts != BAD {
-                        let q = ((h128(ukey) >> 40) & umask) as usize;
+                        let q = ((ph(ukey) >> 40) & umask) as usize;
                         let l = (st.w << 56) | ((q as u64) << 40) | st.pv[q].len() as u64;
                         st.pv[q].push(&mut st.ar, PRec { pk: ukey, ts, price, cat });
                         l
@@ -3683,7 +3755,7 @@ impl Tc {
     }
 }
 
-/// One column of a single-row-group, single-page, PLAIN, uncompressed Parquet file.
+/// One column of a single-row-group, single-page (plus dictionary page), zstd Parquet file.
 struct PCol<'a> {
     name: &'a str,
     ty: i32,          // 1 INT32, 2 INT64, 6 BYTE_ARRAY
@@ -3702,21 +3774,41 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     let mut file = std::fs::File::create(path).expect("create");
     file.write_all(b"PAR1").expect("write");
     let mut pos: usize = 4;
-    // (data page offset, dictionary page offset, total size incl. headers)
-    let mut metas: Vec<(i64, Option<i64>, i64)> = Vec::new();
+    // (data page offset, dictionary page offset, compressed size, uncompressed size, incl. headers)
+    let mut metas: Vec<(i64, Option<i64>, i64, i64)> = Vec::new();
     let mut page: Vec<u8> = Vec::with_capacity(nrows * 8 + 64);
     let mut dict: Vec<u8> = Vec::new();
+    // Pages are zstd compressed (ZL=0: uncompressed). The scorer's container flushes its dirty
+    // output pages before exit (~2.7 ms per MB), so output bytes cost more than compression CPU.
+    let lvl = zlevel();
+    let mut zc = if lvl != 0 { Some(zstd::bulk::Compressor::new(lvl).expect("zstd")) } else { None };
+    let mut zd: Vec<u8> = Vec::new();
+    let mut zp: Vec<u8> = Vec::new();
+    let mut squeeze = |src: &Vec<u8>, dst: &mut Vec<u8>| -> bool {
+        if let Some(z) = zc.as_mut() {
+            let t = Instant::now();
+            dst.clear();
+            dst.reserve(zstd::zstd_safe::compress_bound(src.len()));
+            z.compress_to_buffer(src.as_slice(), dst).expect("zstd");
+            ZNS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    };
     for c in 0..cols.len() {
         page.clear();
         dict.clear();
         let nd = body(c, &mut dict, &mut page);
         let mut size = 0usize;
+        let mut usize_ = 0usize;
         let mut doff = None;
         if let Some(nd) = nd {
+            let dz = if squeeze(&dict, &mut zd) { &zd } else { &dict };
             let mut h = Tc { b: Vec::new(), last: vec![0] };
             h.i32f(1, 2); // DICTIONARY_PAGE
             h.i32f(2, dict.len() as i32);
-            h.i32f(3, dict.len() as i32);
+            h.i32f(3, dz.len() as i32);
             h.begin(7);
             h.i32f(1, nd as i32);
             h.i32f(2, 2); // PLAIN_DICTIONARY
@@ -3724,14 +3816,16 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
             h.b.push(0);
             doff = Some(pos as i64);
             file.write_all(&h.b).expect("write");
-            file.write_all(&dict).expect("write");
-            pos += h.b.len() + dict.len();
-            size += h.b.len() + dict.len();
+            file.write_all(dz).expect("write");
+            pos += h.b.len() + dz.len();
+            size += h.b.len() + dz.len();
+            usize_ += h.b.len() + dict.len();
         }
+        let pz = if squeeze(&page, &mut zp) { &zp } else { &page };
         let mut h = Tc { b: Vec::new(), last: vec![0] };
         h.i32f(1, 0); // DATA_PAGE
         h.i32f(2, page.len() as i32);
-        h.i32f(3, page.len() as i32);
+        h.i32f(3, pz.len() as i32);
         h.begin(5);
         h.i32f(1, nrows as i32);
         h.i32f(2, if nd.is_some() { 2 } else { 0 }); // PLAIN_DICTIONARY / PLAIN
@@ -3741,10 +3835,11 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
         h.b.push(0);
         let off = pos as i64;
         file.write_all(&h.b).expect("write");
-        file.write_all(&page).expect("write");
-        pos += h.b.len() + page.len();
-        size += h.b.len() + page.len();
-        metas.push((off, doff, size as i64));
+        file.write_all(pz).expect("write");
+        pos += h.b.len() + pz.len();
+        size += h.b.len() + pz.len();
+        usize_ += h.b.len() + page.len();
+        metas.push((off, doff, size as i64, usize_ as i64));
     }
     let mut m = Tc { b: Vec::new(), last: vec![0] };
     m.i32f(1, 1);
@@ -3773,8 +3868,9 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     m.list(4, 12, 1);
     m.begin_elem();
     m.list(1, 12, cols.len());
-    let total: i64 = metas.iter().map(|x| x.2).sum();
-    for (c, &(off, doff, sz)) in cols.iter().zip(metas.iter()) {
+    let total: i64 = metas.iter().map(|x| x.3).sum(); // uncompressed
+    let codec = if lvl != 0 { 6 } else { 0 }; // ZSTD / UNCOMPRESSED
+    for (c, &(off, doff, sz, usz)) in cols.iter().zip(metas.iter()) {
         m.begin_elem();
         m.i64f(2, doff.unwrap_or(off));
         m.begin(3);
@@ -3792,9 +3888,9 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
         m.list(3, 8, 1);
         m.varint(c.name.len() as u64);
         m.b.extend_from_slice(c.name.as_bytes());
-        m.i32f(4, 0); // UNCOMPRESSED
+        m.i32f(4, codec);
         m.i64f(5, nrows as i64);
-        m.i64f(6, sz);
+        m.i64f(6, usz);
         m.i64f(7, sz);
         m.i64f(9, off);
         if let Some(d) = doff {
@@ -3812,6 +3908,17 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     m.b.extend_from_slice(&n.to_le_bytes());
     m.b.extend_from_slice(b"PAR1");
     file.write_all(&m.b).expect("write");
+    let nw = 2 + metas.iter().map(|x| if x.1.is_some() { 4 } else { 2 }).sum::<usize>();
+    drop(file);
+    tlog(&format!("wrote {} ({} bytes, {} write calls, closed)", path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), pos + m.b.len(), nw));
+}
+
+/// total zstd compression time over all writer threads (ns), logged with the done line
+static ZNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// zstd level for output pages: ZL env (0 = uncompressed, negative = zstd fast levels), default 1.
+fn zlevel() -> i32 {
+    std::env::var("ZL").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
 }
 
 fn uleb(mut v: u64, out: &mut Vec<u8>) {
@@ -3964,6 +4071,62 @@ fn write_user_raw(path: &Path, r: &URows, cats: &[S], w32: [bool; 3]) {
             out.push(bw as u8);
             hybrid_bitpack(r.top.iter().filter(|&&t| t != NOCAT).copied(), nn, bw, out);
             Some(cats.len())
+        }
+    });
+}
+
+/// campaign_daily through the direct writer: rows are ordered by campaign then day, so
+/// campaign_id and channel are dictionaries with RLE indices; day and the counters as in user_daily.
+fn write_campaign_raw(path: &Path, rows: &[(S, S, i32, [i64; 4])]) {
+    let n = rows.len();
+    // counters stay INT64 as in the crate writer (the table is small; zstd takes the slack)
+    let fit = [false; 4];
+    let it = |w: bool| if w { 1 } else { 2 };
+    let cols = [
+        PCol { name: "campaign_id", ty: 6, optional: false, conv: Some(0), logical: Some(1) },
+        PCol { name: "channel", ty: 6, optional: false, conv: Some(0), logical: Some(1) },
+        PCol { name: "day", ty: 1, optional: false, conv: Some(6), logical: Some(6) },
+        PCol { name: "sessions", ty: it(fit[0]), optional: false, conv: None, logical: None },
+        PCol { name: "purchasing_sessions", ty: it(fit[1]), optional: false, conv: None, logical: None },
+        PCol { name: "revenue_cents", ty: it(fit[2]), optional: false, conv: None, logical: None },
+        PCol { name: "assisted_sessions", ty: it(fit[3]), optional: false, conv: None, logical: None },
+    ];
+    let mut v: Vec<i64> = Vec::with_capacity(n);
+    write_parquet_raw(path, &cols, n, |c, dict, out| match c {
+        0 | 1 => {
+            // dictionary of distinct strings (first-seen order), RLE indices
+            let mut map: hashbrown::HashMap<S, u32, foldhash::fast::FixedState> = Default::default();
+            let mut idx: Vec<u32> = Vec::with_capacity(n);
+            for r in rows {
+                let s = if c == 0 { r.0 } else { r.1 };
+                let nd = map.len() as u32;
+                let i = *map.entry(s).or_insert_with(|| {
+                    dict.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    dict.extend_from_slice(s);
+                    nd
+                });
+                idx.push(i);
+            }
+            let bw = bit_width(map.len() as u64 - 1);
+            out.push(bw as u8);
+            hybrid_rle(&idx, bw, out);
+            Some(map.len())
+        }
+        2 => {
+            let lo = rows.iter().map(|r| r.2).min().unwrap();
+            let hi = rows.iter().map(|r| r.2).max().unwrap();
+            for d in lo..=hi {
+                dict.extend_from_slice(&d.to_le_bytes());
+            }
+            let bw = bit_width((hi - lo) as u64);
+            out.push(bw as u8);
+            hybrid_bitpack(rows.iter().map(|r| (r.2 - lo) as u32), n, bw, out);
+            Some((hi - lo + 1) as usize)
+        }
+        _ => {
+            v.clear();
+            v.extend(rows.iter().map(|r| r.3[c - 3]));
+            int_column(&v, fit[c - 3], dict, out)
         }
     });
 }
