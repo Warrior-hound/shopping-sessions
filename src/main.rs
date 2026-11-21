@@ -3680,7 +3680,7 @@ impl Tc {
     }
 }
 
-/// One column of a single-row-group, single-page, PLAIN, uncompressed Parquet file.
+/// One column of a single-row-group, single-page, PLAIN, zstd-compressed Parquet file.
 struct PCol<'a> {
     name: &'a str,
     ty: i32,          // 1 INT32, 2 INT64, 6 BYTE_ARRAY
@@ -3691,18 +3691,22 @@ struct PCol<'a> {
 
 /// Writes a Parquet file whose page bodies are produced by `body(column, out)` (values after
 /// any definition levels, which `body` writes too). `nvals[c]` = values incl. nulls = rows.
+/// Pages are zstd level 1: the container's dirty output pages are flushed before it exits
+/// (about 2.7 ms per MB on a GCP n2 VM), and user_daily shrinks about 7x (92 MB -> ~12 MB at 20M).
 fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl FnMut(usize, &mut Vec<u8>)) {
-    let mut out: Vec<u8> = Vec::with_capacity(nrows * 48 + 4096);
+    let mut out: Vec<u8> = Vec::with_capacity(nrows * 8 + 4096);
     out.extend_from_slice(b"PAR1");
-    let mut metas: Vec<(i64, i64)> = Vec::new(); // (page offset, total size incl. header)
+    let mut metas: Vec<(i64, i64, i64)> = Vec::new(); // (page offset, compressed size incl. header, uncompressed size incl. header)
     let mut page: Vec<u8> = Vec::new();
+    let mut zc = zstd::bulk::Compressor::new(1).expect("zstd");
     for c in 0..cols.len() {
         page.clear();
         body(c, &mut page);
+        let comp = zc.compress(&page).expect("zstd compress");
         let mut h = Tc { b: Vec::new(), last: vec![0] };
         h.i32f(1, 0); // DATA_PAGE
-        h.i32f(2, page.len() as i32);
-        h.i32f(3, page.len() as i32);
+        h.i32f(2, page.len() as i32); // uncompressed
+        h.i32f(3, comp.len() as i32); // compressed
         h.begin(5);
         h.i32f(1, nrows as i32);
         h.i32f(2, 0); // PLAIN
@@ -3712,8 +3716,8 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
         h.b.push(0);
         let off = out.len() as i64;
         out.extend_from_slice(&h.b);
-        out.extend_from_slice(&page);
-        metas.push((off, (h.b.len() + page.len()) as i64));
+        out.extend_from_slice(&comp);
+        metas.push((off, (h.b.len() + comp.len()) as i64, (h.b.len() + page.len()) as i64));
     }
     let mut m = Tc { b: Vec::new(), last: vec![0] };
     m.i32f(1, 1);
@@ -3742,8 +3746,8 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
     m.list(4, 12, 1);
     m.begin_elem();
     m.list(1, 12, cols.len());
-    let total: i64 = metas.iter().map(|x| x.1).sum();
-    for (c, &(off, sz)) in cols.iter().zip(metas.iter()) {
+    let total: i64 = metas.iter().map(|x| x.2).sum(); // uncompressed bytes
+    for (c, &(off, sz, usz)) in cols.iter().zip(metas.iter()) {
         m.begin_elem();
         m.i64f(2, off);
         m.begin(3);
@@ -3754,9 +3758,9 @@ fn write_parquet_raw(path: &Path, cols: &[PCol], nrows: usize, mut body: impl Fn
         m.list(3, 8, 1);
         m.varint(c.name.len() as u64);
         m.b.extend_from_slice(c.name.as_bytes());
-        m.i32f(4, 0); // UNCOMPRESSED
+        m.i32f(4, 6); // ZSTD
         m.i64f(5, nrows as i64);
-        m.i64f(6, sz);
+        m.i64f(6, usz);
         m.i64f(7, sz);
         m.i64f(9, off);
         m.end();
@@ -3800,8 +3804,9 @@ fn write_user_raw(path: &Path, r: &URows, cats: &[S]) {
     let cols = [
         PCol { name: "user_id", ty: 6, optional: false, conv: Some(0), logical: Some(1) },
         PCol { name: "day", ty: 1, optional: false, conv: Some(6), logical: Some(6) },
-        PCol { name: "sessions", ty: 2, optional: false, conv: None, logical: None },
-        PCol { name: "events", ty: 2, optional: false, conv: None, logical: None },
+        // sessions and events per person-day fit in 32 bits (any integer width is accepted)
+        PCol { name: "sessions", ty: 1, optional: false, conv: None, logical: None },
+        PCol { name: "events", ty: 1, optional: false, conv: None, logical: None },
         PCol { name: "revenue_cents", ty: 2, optional: false, conv: None, logical: None },
         PCol { name: "top_category", ty: 6, optional: true, conv: Some(0), logical: Some(1) },
     ];
@@ -3823,10 +3828,16 @@ fn write_user_raw(path: &Path, r: &URows, cats: &[S]) {
                 out.extend_from_slice(&d.to_le_bytes());
             }
         }
-        2 | 3 | 4 => {
-            let v = [&r.ses, &r.ev, &r.rev][c - 2];
-            out.reserve(n * 8);
+        2 | 3 => {
+            let v = [&r.ses, &r.ev][c - 2];
+            out.reserve(n * 4);
             for &x in v.iter() {
+                out.extend_from_slice(&(x as i32).to_le_bytes());
+            }
+        }
+        4 => {
+            out.reserve(n * 8);
+            for &x in r.rev.iter() {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
