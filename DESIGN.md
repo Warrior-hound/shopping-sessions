@@ -185,3 +185,9 @@ After those: PGO, and racing the knobs (threads 8 vs 16, partition count, chunk 
 - **Per-phase memory reservations with a refusal fallback:** each phase reserves its arena up front. If a reservation is refused, smaller sizes are tried, down to none (all blocks from the heap), so the run never aborts on an address-space limit.
 
 Correctness gate for a18: 36/36 fixtures and dev MATCH under the scorer's Docker flags; the Linux gate shows 89/89 MATCH, including 60M rows against reference.py. The build uses target-cpu=x86-64-v3, and objdump finds no AVX-512 (zmm/k-register) instructions.
+
+## Changes in a19–a22
+- **Line-wide quote validation (a19):** for a line under 128 bytes, one mask test checks that every quote sits on a field's first byte or last byte. Each field is then checked per field: its first byte is quoted if and only if its last byte is quoted, and a quoted field is at least 2 bytes long.
+- **Hash plus byte check for event_ids that do not pack (a20):** an event_id that does not fit the packed u64 form is not interned. Its dedup record carries a hash and a slice of the input bytes, kept in a separate dedup table, and every hash match is confirmed byte for byte.
+- **Partitioned ID-to-person join (a22):** valid event copies are scattered by hash of the user key at parse time, and the link table is split by the same partition. Each phase-2b task joins one user partition against its own small, cache-resident link table.
+- a21 (a direct index for campaign IDs) was tried and reverted; it is not in the code.

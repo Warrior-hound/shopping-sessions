@@ -455,7 +455,15 @@ fn for_rows<const N: usize>(data: S, start: usize, end: usize, mut f: impl FnMut
                 let cm = cm & lm;
                 if cm.count_ones() as usize == N - 1 {
                     let qm = qm & lm;
-                    let mut ok = true;
+                    // A field is valid iff it has no quote, or '"' exactly at its first and last
+                    // byte and length >= 2. Line-wide part: every quote sits on a field's first
+                    // byte (after a comma or at 0) or last byte (before a comma or the end).
+                    let starts = (cm << 1) | 1;
+                    let lasts = (cm | (1u128 << e)) >> 1;
+                    let mut ok = (qm & !(starts | lasts)) == 0;
+                    // per field: first byte quoted <=> last byte quoted, and not a 1-byte field
+                    let qw = [qm as u64, (qm >> 64) as u64];
+                    let bit = |i: usize| ((qw[(i >> 6) & 1] >> (i & 63)) & 1) as usize;
                     let mut s = 0usize;
                     let mut c = cm;
                     for k in 0..N {
@@ -467,13 +475,11 @@ fn for_rows<const N: usize>(data: S, start: usize, end: usize, mut f: impl FnMut
                             e
                         };
                         let l = fe - s; // < 128
-                        let q = (qm >> s) & ((1u128 << l) - 1);
-                        let want = 1u128 | 1u128.wrapping_shl((l as u32).wrapping_sub(1));
-                        let isq = q != 0;
-                        // valid: no quote, or exactly '"' at both ends of a field of length >= 2
-                        ok &= !isq | ((q == want) & (l >= 2));
-                        let a = s + isq as usize;
-                        let b = (fe - isq as usize).max(a);
+                        let qs = bit(s) & (l != 0) as usize;
+                        let qe = bit(fe.wrapping_sub(1) & 127) & (l != 0) as usize;
+                        ok &= (qs == qe) & !((qs == 1) & (l < 2));
+                        let a = s + qs;
+                        let b = (fe - qs).max(a);
                         out[k] = unsafe { std::slice::from_raw_parts(base.add(p + a), b - a) };
                         s = fe + 1;
                     }
@@ -860,6 +866,15 @@ static LONG_LIST: std::sync::OnceLock<Vec<Vec<S>>> = std::sync::OnceLock::new();
 
 #[inline]
 fn idk(s: S) -> K {
+    match pack(s) {
+        Some(k) => k,
+        None => idk_long(s),
+    }
+}
+
+/// The packed key of an ID, or None when it does not pack (see `K`).
+#[inline(always)]
+fn pack(s: S) -> Option<K> {
     let n = s.len();
     if n <= 10 {
         let mut code = 0u64;
@@ -870,10 +885,10 @@ fn idk(s: S) -> K {
             code = (code << 6) | (r & 63) as u64;
         }
         if bad != 0xFF && bad & 0xC0 == 0 {
-            return ((code << (6 * (10 - n))) << 4) | n as u64;
+            return Some(((code << (6 * (10 - n))) << 4) | n as u64);
         }
     }
-    idk_long(s)
+    None
 }
 
 #[inline(never)]
@@ -986,6 +1001,18 @@ struct DRec {
 }
 const NOLOC: u64 = u64::MAX;
 
+/// Dedup record of an event_id that does not pack. event_ids only need equality (they are
+/// never output or ordered), so instead of interning them they carry a hash plus their bytes
+/// (a slice of the input mapping), and dedup confirms every hash match byte for byte.
+#[derive(Clone, Copy)]
+struct DRecL {
+    h: u64, // never 0 (0 marks an empty table slot)
+    ing: i64,
+    loc: u64,
+    ptr: usize,
+    len: usize,
+}
+
 /// Surviving event, bucketed by hash(person). Also the valid-copy stream record (pk = user key).
 #[derive(Clone, Copy)]
 struct PRec {
@@ -1023,6 +1050,9 @@ struct Links {
     tab: &'static [(K, K)], // key 0 (the empty string) marks an empty slot; empty IDs are never linked
     mask: usize,
     n: usize,
+    // the same (id, person) entries split by hash(id) partition (bits 40.. & pmask), so a
+    // phase-2b task joins one user partition against a cache-resident table
+    parts: Vec<Vec<(K, K)>>,
 }
 
 const PF: usize = 16; // prefetch distance (items)
@@ -1080,7 +1110,7 @@ impl Links {
     }
 }
 
-fn build_links(lk_files: &[S]) -> Links {
+fn build_links(lk_files: &[S], np: usize) -> Links {
     let c0 = tcpu();
     let mut pairs: Vec<(K, K)> = Vec::new();
     let mut f: [S; 2] = [b""; 2];
@@ -1161,7 +1191,13 @@ fn build_links(lk_files: &[S]) -> Links {
         }
     }
     log(&format!("links built: {} pairs, cpu parse {:.3} s, union-find + table {:.3} s", pairs.len(), c1 - c0, tcpu() - c1));
-    Links { tab: t, mask, n }
+    let mut parts: Vec<Vec<(K, K)>> = vec![Vec::new(); np];
+    for &e in t.iter() {
+        if e.0 != 0 {
+            parts[((h128(e.0) >> 40) as usize) & (np - 1)].push(e);
+        }
+    }
+    Links { tab: t, mask, n, parts }
 }
 
 #[derive(Default)]
@@ -1206,7 +1242,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-        .max(1);
+        .clamp(1, 256); // worker id fits the 8 bits it gets in a dedup locator
 
     let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let w0 = manifest_ts(&man, "window_start");
@@ -1233,7 +1269,7 @@ fn main() {
     // the link table is published through LINKS; phase 2 starts deduplicating without it
     // and only the person-map steps wait for it
     std::thread::spawn(move || {
-        let l = build_links(&lk_files);
+        let l = build_links(&lk_files, np);
         let _ = LINKS.set(l);
         let _g = LK_M.lock().unwrap();
         LK_CV.notify_all();
@@ -1288,7 +1324,8 @@ fn main() {
         w: u64,
         ar: Arena,
         dd: Vec<Bkt<DRec>>, // dedup stream, by hash(event_id), npd partitions
-        pv: Bkt<PRec>,      // valid copies in parse order (sequential, no scatter)
+        ddl: Vec<Bkt<DRecL>>, // same for event_ids that do not pack (empty for generator data)
+        pv: Vec<Bkt<PRec>>, // valid copies, by hash(user key) partition (np partitions)
         cl: Bkt<CRaw>,
         t_ev: f64,
         t_cl: f64,
@@ -1315,7 +1352,8 @@ fn main() {
             w: w as u64,
             ar: Arena::new(reg1),
             dd: (0..npd).map(|_| Bkt::new()).collect(),
-            pv: Bkt::new(),
+            ddl: (0..npd).map(|_| Bkt::new()).collect(),
+            pv: (0..np).map(|_| Bkt::new()).collect(),
             cl: Bkt::new(),
             t_ev: 0.0,
             t_cl: 0.0,
@@ -1374,16 +1412,25 @@ fn main() {
                         ts = t;
                         ukey = idk16(f[1], lim);
                     }
-                    let key = idk16(f[0], lim);
-                    let h = h128(key);
+                    let _ = lim;
                     let loc = if ts != BAD {
-                        let l = (st.w << 40) | st.pv.len() as u64;
-                        st.pv.push(&mut st.ar, PRec { pk: ukey, ts, price, cat });
+                        let q = ((h128(ukey) >> 40) & pmask) as usize;
+                        let l = (st.w << 56) | ((q as u64) << 40) | st.pv[q].len() as u64;
+                        st.pv[q].push(&mut st.ar, PRec { pk: ukey, ts, price, cat });
                         l
                     } else {
                         NOLOC
                     };
-                    st.dd[((h >> 40) & dmask) as usize].push(&mut st.ar, DRec { key, ing, loc });
+                    match pack(f[0]) {
+                        Some(key) => {
+                            let h = h128(key);
+                            st.dd[((h >> 40) & dmask) as usize].push(&mut st.ar, DRec { key, ing, loc });
+                        }
+                        None => {
+                            let h = hs(f[0]) | 1;
+                            st.ddl[((h >> 40) & dmask) as usize].push(&mut st.ar, DRecL { h, ing, loc, ptr: f[0].as_ptr() as usize, len: f[0].len() });
+                        }
+                    }
                 });
                 st.t_ev += tcpu() - tt;
             } else {
@@ -1409,7 +1456,7 @@ fn main() {
         },
     );
     {
-        let ne: usize = p1.iter().map(|s| s.dd.iter().map(|v| v.len()).sum::<usize>()).sum();
+        let ne: usize = p1.iter().map(|s| (s.dd.iter().map(|v| v.len()).sum::<usize>() + s.ddl.iter().map(|v| v.len()).sum::<usize>())).sum();
         let nc: usize = p1.iter().map(|s| s.cl.len()).sum();
         let te: f64 = p1.iter().map(|s| s.t_ev).sum();
         let tc: f64 = p1.iter().map(|s| s.t_cl).sum();
@@ -1431,15 +1478,18 @@ fn main() {
             a += CSLB;
         }
     }
-    let mut woff: Vec<usize> = vec![0; p1.len() + 1];
+    // global index of valid copy (worker w, user partition q, index i) = off[w * np + q] + i
+    let mut off: Vec<usize> = vec![0; p1.len() * np + 1];
     for (w, s) in p1.iter().enumerate() {
-        woff[w + 1] = woff[w] + s.pv.len();
+        for q in 0..np {
+            off[w * np + q + 1] = off[w * np + q] + s.pv[q].len();
+        }
     }
-    let nvalid = woff[p1.len()];
+    let nvalid = off[p1.len() * np];
     let kill: Vec<std::sync::atomic::AtomicU64> = (0..(nvalid + 63) / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let kill_loc = |loc: u64| {
         if loc != NOLOC {
-            let g = woff[(loc >> 40) as usize] + (loc & ((1 << 40) - 1)) as usize;
+            let g = off[(loc >> 56) as usize * np + ((loc >> 40) & 0xFFFF) as usize] + (loc & ((1 << 40) - 1)) as usize;
             kill[g >> 6].fetch_or(1 << (g & 63), Ordering::Relaxed);
         }
     };
@@ -1514,6 +1564,48 @@ fn main() {
                         }
                     }
                 }
+                // event_ids that do not pack: same rule, hash match confirmed byte for byte
+                let capl: usize = p1.iter().map(|s| s.ddl[p].len()).sum();
+                if capl > 0 {
+                    let mut sz = 16usize;
+                    while sz < capl * 2 {
+                        sz *= 2;
+                    }
+                    let mask = sz - 1;
+                    let bytes = |r: &DRecL| unsafe { std::slice::from_raw_parts(r.ptr as *const u8, r.len) };
+                    let mut tl: Vec<DRecL> = vec![DRecL { h: 0, ing: 0, loc: 0, ptr: 0, len: 0 }; sz];
+                    for s in p1.iter() {
+                        for r in s.ddl[p].iter() {
+                            let mut i = (r.h >> 8) as usize & mask;
+                            loop {
+                                let e = &mut tl[i];
+                                if e.h == r.h && bytes(e) == bytes(r) {
+                                    if r.ing < e.ing {
+                                        kills += (e.loc != NOLOC) as usize;
+                                        kill_loc(e.loc);
+                                        valid_winners -= (e.loc != NOLOC) as usize;
+                                        valid_winners += (r.loc != NOLOC) as usize;
+                                        *e = *r;
+                                    } else {
+                                        kills += (r.loc != NOLOC) as usize;
+                                        kill_loc(r.loc);
+                                    }
+                                    break;
+                                }
+                                if e.h == 0 {
+                                    *e = *r;
+                                    winners += 1;
+                                    valid_winners += (r.loc != NOLOC) as usize;
+                                    break;
+                                }
+                                i = (i + 1) & mask;
+                            }
+                        }
+                    }
+                    for s in p1.iter() {
+                        s.ddl[p].recycle_into(&mut st.ar);
+                    }
+                }
                 st.kills += kills;
                 st.winners += winners;
                 st.valid_winners += valid_winners;
@@ -1541,44 +1633,58 @@ fn main() {
             }
         },
     );
-    // phase 2b over the valid-copy streams
-    let pv_slices: Vec<Vec<&[PRec]>> = p1.iter().map(|s| s.pv.slices().collect()).collect();
-    let mut vtasks: Vec<(usize, usize)> = Vec::new();
-    for (w, s) in pv_slices.iter().enumerate() {
-        let mut a = 0;
-        while a < s.len() {
-            vtasks.push((w, a));
-            a += CSLB;
-        }
-    }
+    // phase 2b: per user partition, join its valid copies against that partition's links
+    // (a small table, cache resident), skip killed copies, scatter by hash(person)
     let per_pv = BLK_BYTES / std::mem::size_of::<PRec>();
     let reg2 = Region::new(ev_bytes / 40 * std::mem::size_of::<PRec>() + nt * ((np + 2) * BLK_BYTES + SLAB));
     let p2 = par(
         nt,
-        vtasks.len(),
+        np,
         |_| new_p2(reg2),
-        |st, t| {
+        |st, q| {
             let tt = tcpu();
-            let (w, a) = vtasks[t];
             let links = links_wait();
-            let v = &pv_slices[w];
-            for (bi, sl) in v[a..(a + CSLB).min(v.len())].iter().enumerate() {
-                let base = woff[w] + (a + bi) * per_pv;
-                let alive = |j: usize| {
-                    let g = base + j;
-                    (kill[g >> 6].load(Ordering::Relaxed) >> (g & 63)) & 1 == 0
-                };
-                for (j, r) in sl.iter().enumerate() {
-                    if j + PF < sl.len() {
-                        links.prefetch(sl[j + PF].pk);
-                    }
-                    if !alive(j) {
-                        continue;
-                    }
-                    let pk = links.person(r.pk);
-                    st.ev[((h128(pk) >> 40) & pmask) as usize].push(&mut st.ar, PRec { pk, ts: r.ts, price: r.price, cat: r.cat });
+            let lp = &links.parts[q];
+            let mut sz = 16usize;
+            while sz < lp.len() * 2 {
+                sz *= 2;
+            }
+            let mask = sz - 1;
+            let mut lt: Vec<(K, K)> = vec![(0, 0); sz];
+            for &(k, v) in lp {
+                let mut i = h128(k) as usize & mask;
+                while lt[i].0 != 0 {
+                    i = (i + 1) & mask;
                 }
-                st.ar.free.push(sl.as_ptr() as *mut u8);
+                lt[i] = (k, v);
+            }
+            let person = |k: K| -> K {
+                let mut i = h128(k) as usize & mask;
+                loop {
+                    let e = lt[i];
+                    if e.0 == k {
+                        return e.1;
+                    }
+                    if e.0 == 0 {
+                        return k;
+                    }
+                    i = (i + 1) & mask;
+                }
+            };
+            for (w, s) in p1.iter().enumerate() {
+                let o = off[w * np + q];
+                for (bi, sl) in s.pv[q].slices().enumerate() {
+                    let base = o + bi * per_pv;
+                    for (j, r) in sl.iter().enumerate() {
+                        let g = base + j;
+                        if (kill[g >> 6].load(Ordering::Relaxed) >> (g & 63)) & 1 != 0 {
+                            continue;
+                        }
+                        let pk = person(r.pk);
+                        st.ev[((h128(pk) >> 40) & pmask) as usize].push(&mut st.ar, PRec { pk, ts: r.ts, price: r.price, cat: r.cat });
+                    }
+                }
+                s.pv[q].recycle_into(&mut st.ar);
             }
             st.t_map += tcpu() - tt;
         },
@@ -1591,7 +1697,7 @@ fn main() {
         let kills: usize = p2c.iter().map(|s| s.kills).sum();
         let winners: usize = p2c.iter().map(|s| s.winners).sum();
         let vw: usize = p2c.iter().map(|s| s.valid_winners).sum();
-        let copies: usize = p1.iter().map(|s| s.dd.iter().map(|v| v.len()).sum::<usize>()).sum();
+        let copies: usize = p1.iter().map(|s| (s.dd.iter().map(|v| v.len()).sum::<usize>() + s.ddl.iter().map(|v| v.len()).sum::<usize>())).sum();
         // invariants: every valid copy is either the kept winner or killed; every copy is a winner or a loser
         let ok = nvalid == vw + kills && n == vw && copies >= winners;
         log(&format!(
