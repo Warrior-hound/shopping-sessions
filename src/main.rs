@@ -648,8 +648,9 @@ fn for_rows128<const N: usize>(data: S, start: usize, end: usize, mut f: impl Fn
 /// `idk` via `pack16` (fast path only; the wide path keeps `idk16`).
 #[inline(always)]
 fn idkf(s: S, lim: usize) -> K {
-    match pack16(s, lim) {
+    match kfast(s, lim) {
         Some(k) => k,
+        None if s.is_empty() => 0,
         None => idk_long(s),
     }
 }
@@ -1634,8 +1635,9 @@ fn idk_long_own(s: &[u8]) -> K {
 /// `idkf` for pread buffers (long IDs are copied when first interned).
 #[inline(always)]
 fn idkf_own(s: S, lim: usize) -> K {
-    match pack16(s, lim) {
+    match kfast(s, lim) {
         Some(k) => k,
+        None if s.is_empty() => 0,
         None => idk_long_own(s),
     }
 }
@@ -1724,10 +1726,66 @@ static LONG_LIST: std::sync::OnceLock<Vec<Vec<S>>> = std::sync::OnceLock::new();
 
 #[inline]
 fn idk(s: S) -> K {
-    match pack(s) {
+    if s.is_empty() {
+        return 0;
+    }
+    match kfast_s(s) {
         Some(k) => k,
         None => idk_long(s),
     }
+}
+
+/// Fast-shape key (z23): an ID of 2..=9 bytes, all ASCII (1..=0x7F, no NUL) becomes
+/// bit 63 | first byte << 56 | the other (up to 8) bytes as 7-bit fields, first most
+/// significant, zero padded. Integer order of two fast keys == byte-wise order of the IDs
+/// (no NUL, so the zero padding sorts a prefix first). `x` = the 8 bytes after the first,
+/// big-endian (bytes past the ID are masked off here).
+#[inline(always)]
+fn kfast_x(c0: u64, x: u64, n: usize) -> Option<K> {
+    const L: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = 0x8080_8080_8080_8080;
+    let m = u64::MAX << (8 * (9 - n)); // the n - 1 ID bytes (n in 2..=9)
+    let y = x & m;
+    let t = y | (!m & L); // padding bytes -> 0x01: only ID bytes can be 0
+    let bad = ((t.wrapping_sub(L) & !t) | t) & H; // a zero byte or a byte >= 0x80
+    if (bad == 0) & (c0.wrapping_sub(1) < 0x7F) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let v = unsafe { core::arch::x86_64::_pext_u64(y, 0x7F7F_7F7F_7F7F_7F7F) };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let v = {
+            let mut v = 0u64;
+            for j in 0..8 {
+                v = (v << 7) | ((y >> (56 - 8 * j)) & 0x7F);
+            }
+            v
+        };
+        return Some((1u64 << 63) | (c0 << 56) | v);
+    }
+    None
+}
+
+/// `kfast_x` from the slice alone (no read past it).
+#[inline(always)]
+fn kfast_s(s: S) -> Option<K> {
+    let n = s.len();
+    if n.wrapping_sub(2) < 8 {
+        let mut b = [0u8; 8];
+        b[..n - 1].copy_from_slice(&s[1..]);
+        return kfast_x(s[0] as u64, u64::from_be_bytes(b), n);
+    }
+    None
+}
+
+/// `kfast_s` with one unaligned 8-byte load when the 9 bytes from s are readable (s + 9 <= lim).
+#[inline(always)]
+fn kfast(s: S, lim: usize) -> Option<K> {
+    let n = s.len();
+    let p = s.as_ptr();
+    if (n.wrapping_sub(2) < 8) & (p as usize + 9 <= lim) {
+        let x = u64::from_be(unsafe { std::ptr::read_unaligned(p.add(1) as *const u64) });
+        return kfast_x(unsafe { *p } as u64, x, n);
+    }
+    kfast_s(s)
 }
 
 /// The packed key of an ID, or None when it does not pack (see `K`).
@@ -1825,9 +1883,10 @@ fn freeze_long() {
     let _ = LONG_LIST.set(v);
 }
 
+/// Interned key (not fast-shape, not the empty ID 0).
 #[inline]
 fn is_long(k: K) -> bool {
-    (k & 0xF) == 0xF
+    (k >> 63 == 0) & (k != 0)
 }
 
 /// Bytes of an ID key. Long keys need `freeze_long` (or the interner) to have run.
@@ -1835,41 +1894,54 @@ fn long_bytes(k: K) -> S {
     let i = (k >> 4) as usize;
     let (sh, idx) = (i & (NSHARD - 1), i >> 6);
     match LONG_LIST.get() {
-        Some(v) => v[sh][idx],
-        None => LONG[sh].lock().unwrap().as_ref().unwrap().list[idx],
+        Some(v) if idx < v[sh].len() => v[sh][idx],
+        _ => LONG[sh].lock().unwrap().as_ref().unwrap().list[idx],
     }
 }
 
 fn id_bytes(k: K, out: &mut Vec<u8>) {
     if is_long(k) {
         out.extend_from_slice(long_bytes(k));
-    } else {
-        let n = (k & 0xF) as usize;
-        let code = k >> 4;
-        for j in 0..n {
-            out.push(SYM[((code >> (6 * (9 - j))) & 63) as usize]);
-        }
+    } else if k != 0 {
+        let mut b = [0u8; 9];
+        let n = fast_bytes(k, &mut b);
+        out.extend_from_slice(&b[..n]);
     }
+}
+
+/// Bytes of a fast key (k >> 63 == 1) into b; returns the length.
+#[inline]
+fn fast_bytes(k: K, b: &mut [u8; 9]) -> usize {
+    b[0] = ((k >> 56) & 0x7F) as u8;
+    let mut n = 1;
+    while n < 9 {
+        let c = ((k >> (7 * (8 - n))) & 0x7F) as u8;
+        if c == 0 {
+            break;
+        }
+        b[n] = c;
+        n += 1;
+    }
+    n
 }
 
 #[inline]
 fn id_cmp(a: K, b: K) -> std::cmp::Ordering {
-    if !is_long(a) && !is_long(b) {
-        return a.cmp(&b);
+    if (a & b) >> 63 == 1 {
+        return a.cmp(&b); // two fast keys: integer order is byte order
     }
-    // no allocation: long IDs are slices of the input, short ones decode into a stack buffer
-    fn bytes(k: K, buf: &mut [u8; 10]) -> &[u8] {
+    // no allocation: long IDs are interned slices, fast ones decode into a stack buffer
+    fn bytes(k: K, buf: &mut [u8; 9]) -> &[u8] {
         if is_long(k) {
             return long_bytes(k);
         }
-        let n = (k & 0xF) as usize;
-        let code = k >> 4;
-        for j in 0..n {
-            buf[j] = SYM[((code >> (6 * (9 - j))) & 63) as usize];
+        if k == 0 {
+            return &buf[..0];
         }
+        let n = fast_bytes(k, buf);
         &buf[..n]
     }
-    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    let (mut x, mut y) = ([0u8; 9], [0u8; 9]);
     bytes(a, &mut x).cmp(bytes(b, &mut y))
 }
 
@@ -2232,6 +2304,166 @@ struct URows {
     top: Vec<u32>,
 }
 
+// ------------------------------------------------------------------ phase-3 sessions
+/// Time buckets of width GAP: events in one bucket are at most GAP - 1 ms apart, so they always share
+/// a session; buckets that are not adjacent are more than GAP apart, so they never do. A person's
+/// sessions therefore follow from per-bucket (min, max, count) in bucket order, with no sort.
+/// Event ts are u32 offsets, so NB buckets cover every value.
+const NB: usize = ((1u64 << 32) / GAP as u64 + 1) as usize;
+const NBW: usize = NB.div_ceil(64);
+
+/// Per-worker bucket state. Between calls every bucket is empty (min u32::MAX, max 0, count 0, bit 0).
+struct Bk {
+    bmin: Vec<u32>,
+    bmax: Vec<u32>,
+    bcnt: Vec<u32>,
+    bits: Vec<u64>,
+}
+
+impl Bk {
+    fn new() -> Self {
+        Bk { bmin: vec![u32::MAX; NB], bmax: vec![0; NB], bcnt: vec![0; NB], bits: vec![0; NBW] }
+    }
+}
+
+/// One person's sessions from events (ts << 32 | pc, any order): `ses` gets (start, end, events) in
+/// time order, `pur` the purchase events (pc != 0) sorted ascending.
+fn sessions_bucket(e: &[u64], bk: &mut Bk, ses: &mut Vec<(u32, u32, u32)>, pur: &mut Vec<u64>) {
+    ses.clear();
+    pur.clear();
+    let (mut lo, mut hi) = (NBW, 0usize);
+    let (bmin, bmax, bcnt, bits) = (&mut bk.bmin[..NB], &mut bk.bmax[..NB], &mut bk.bcnt[..NB], &mut bk.bits[..NBW]);
+    for &x in e {
+        let ts = (x >> 32) as u32;
+        // ts < 2^32, so b < NB and w < NBW
+        let b = (ts / GAP as u32) as usize;
+        let w = b >> 6;
+        unsafe {
+            *bits.get_unchecked_mut(w) |= 1u64 << (b & 63);
+            let m = bmin.get_unchecked_mut(b);
+            *m = (*m).min(ts);
+            let m = bmax.get_unchecked_mut(b);
+            *m = (*m).max(ts);
+            *bcnt.get_unchecked_mut(b) += 1;
+        }
+        lo = lo.min(w);
+        hi = hi.max(w);
+        if x as u32 != 0 {
+            pur.push(x);
+        }
+    }
+    let gap = GAP as u32;
+    let mut run_max = 0u32;
+    for w in lo..=hi {
+        let mut bw = bits[w];
+        bits[w] = 0;
+        while bw != 0 {
+            let b = w * 64 + bw.trailing_zeros() as usize;
+            bw &= bw - 1;
+            let (mn, mx, c) = (bmin[b], bmax[b], bcnt[b]);
+            (bmin[b], bmax[b], bcnt[b]) = (u32::MAX, 0, 0);
+            // buckets ascend, so mn > run_max of every earlier bucket
+            if ses.is_empty() || mn - run_max > gap {
+                ses.push((mn, mx, c));
+            } else {
+                let l = ses.len() - 1;
+                ses[l].1 = mx;
+                ses[l].2 += c;
+            }
+            run_max = mx;
+        }
+    }
+    if pur.len() > 1 {
+        pur.sort_unstable();
+    }
+}
+
+/// Phase-3 person interning: open addressing (linear probing) with the key inline, so a hit is one
+/// probe of one 16 B slot. pid u32::MAX marks an empty slot. Grows at load 1/2.
+struct Itab {
+    t: Vec<(K, u32)>,
+    mask: usize,
+}
+
+impl Itab {
+    fn new() -> Self {
+        Itab { t: Vec::new(), mask: 0 }
+    }
+    fn reset(&mut self, n: usize) {
+        let sz = (n * 2).next_power_of_two().max(64);
+        self.t.clear();
+        self.t.resize(sz, (0, u32::MAX));
+        self.mask = sz - 1;
+    }
+    /// pid of k, inserting it as `names.len()` when absent
+    #[inline]
+    fn intern(&mut self, k: K, names: &mut Vec<K>) -> u32 {
+        let mut i = h128(k) as usize & self.mask;
+        loop {
+            // i <= mask < t.len()
+            let e = unsafe { self.t.get_unchecked_mut(i) };
+            if e.1 == u32::MAX {
+                let pid = names.len() as u32;
+                *e = (k, pid);
+                names.push(k);
+                if names.len() * 2 > self.mask + 1 {
+                    self.grow(names);
+                }
+                return pid;
+            }
+            if e.0 == k {
+                return e.1;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline]
+    fn find(&self, k: K) -> u32 {
+        let mut i = h128(k) as usize & self.mask;
+        loop {
+            let e = unsafe { self.t.get_unchecked(i) };
+            if e.1 == u32::MAX || e.0 == k {
+                return e.1;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn grow(&mut self, names: &[K]) {
+        self.reset(names.len() * 2);
+        for (pid, &k) in names.iter().enumerate() {
+            let mut i = h128(k) as usize & self.mask;
+            while self.t[i].1 != u32::MAX {
+                i = (i + 1) & self.mask;
+            }
+            self.t[i] = (k, pid as u32);
+        }
+    }
+}
+
+/// Reference path (sort + gap sweep), same contract as `sessions_bucket`; P3SORT=1 uses it.
+fn sessions_sort(e: &mut [u64], ses: &mut Vec<(u32, u32, u32)>, pur: &mut Vec<u64>) {
+    ses.clear();
+    pur.clear();
+    e.sort_unstable();
+    let gap = GAP as u32;
+    let mut i = 0;
+    while i < e.len() {
+        let start = (e[i] >> 32) as u32;
+        let mut prev = start;
+        let mut j = i;
+        // equal timestamps have gap 0, so ties always share a session (order-free)
+        while j < e.len() && ((e[j] >> 32) as u32) - prev <= gap {
+            prev = (e[j] >> 32) as u32;
+            if e[j] as u32 != 0 {
+                pur.push(e[j]);
+            }
+            j += 1;
+        }
+        ses.push((start, prev, (j - i) as u32));
+        i = j;
+    }
+}
+
 fn flush(rows: &mut URows, name: K, day: i64, ses: i64, ev: i64, rev: i64, catsum: &[(u32, i64)]) {
     let mut top = NOCAT;
     let mut best = -1i64;
@@ -2558,7 +2790,7 @@ fn main_fast() -> bool {
                     } else {
                         (NOLOC, NOLOC32)
                     };
-                    match pack16(f[0], lim) {
+                    match kfast(f[0], lim) {
                         Some(key) => {
                             let h = ph(key);
                             let isec = isec0 - ibase;
@@ -2997,14 +3229,19 @@ fn main_fast() -> bool {
         pos: Vec<usize>,
         coff: Vec<usize>,
         cpos: Vec<usize>,
-        tab: HashTable<u32>,
+        tab: Itab,
+        vals: Vec<u64>,
         cslot: Vec<u32>, // campaign -> open island index while a person's assists are built (u32::MAX: none)
+        bk: Bk,
+        ses: Vec<(u32, u32, u32)>,
+        pur: Vec<u64>,
         t_grp: f64,
         t_sort: f64,
         t_sess: f64,
         tk: Vec<(u32, u32, f64, f64)>, // DIAG: (partition, events, start s, dur s) per task
     }
     let organic = ncamp as u32;
+    let p3sort = std::env::var_os("P3SORT").is_some_and(|v| v != "0");
     let nsurv: usize = p2.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     // largest partitions first (LPT): every partition's size is known after the scatter, so one
     // giant person's partition starts at once instead of straggling at the end of the phase
@@ -3024,7 +3261,8 @@ fn main_fast() -> bool {
                 let c = nsurv / (nt * 4) + 1024;
                 URows { name: Vec::with_capacity(c), day: Vec::with_capacity(c), ses: Vec::with_capacity(c), ev: Vec::with_capacity(c), rev: Vec::with_capacity(c), top: Vec::with_capacity(c) }
             },
-            tab: HashTable::new(),
+            tab: Itab::new(),
+            vals: Vec::new(),
             acc: vec![[0i64; 4]; (ncamp + 1) * ndays],
             evs: Vec::new(),
             cks: Vec::new(),
@@ -3036,6 +3274,9 @@ fn main_fast() -> bool {
             coff: Vec::new(),
             cpos: Vec::new(),
             cslot: vec![u32::MAX; ncamp + 1],
+            bk: Bk::new(),
+            ses: Vec::new(),
+            pur: Vec::new(),
             t_grp: 0.0,
             t_sort: 0.0,
             t_sess: 0.0,
@@ -3047,28 +3288,26 @@ fn main_fast() -> bool {
             let tt = tcpu();
             let cap: usize = p2.iter().map(|s| s.ev[q].len()).sum();
             let tab = &mut st.tab;
-            tab.clear();
-            tab.reserve(cap / 8 + 16, |_| 0);
+            tab.reset(cap / 16 + 16);
             let names = &mut st.names;
             let cnt = &mut st.cnt;
             let pids = &mut st.pids;
+            let vals = &mut st.vals;
             names.clear();
             cnt.clear();
             pids.clear();
+            vals.clear();
+            // one pass over the partition's records: pid and the event value are staged in
+            // worker buffers, so the scatter does not read the records again
             for s in p2.iter() {
                 for r in s.ev[q].iter() {
-                    let pid = match tab.entry(h128(r.pk), |&i| names[i as usize] == r.pk, |&i| h128(names[i as usize])) {
-                        Entry::Occupied(o) => *o.get(),
-                        Entry::Vacant(v) => {
-                            let i = names.len() as u32;
-                            names.push(r.pk);
-                            cnt.push(0);
-                            v.insert(i);
-                            i
-                        }
-                    };
+                    let pid = tab.intern(r.pk, names);
+                    if pid as usize == cnt.len() {
+                        cnt.push(0);
+                    }
                     cnt[pid as usize] += 1;
                     pids.push(pid);
+                    vals.push(((r.ts as u64) << 32) | r.pc as u64);
                 }
             }
             let npers = names.len();
@@ -3090,13 +3329,12 @@ fn main_fast() -> bool {
             evs.reserve(cap);
             // every slot 0..cap is written exactly once by the scatter below
             unsafe { evs.set_len(cap) };
-            let mut k = 0;
-            for s in p2.iter() {
-                for r in s.ev[q].iter() {
-                    let pid = pids[k] as usize;
-                    k += 1;
-                    evs[pos[pid]] = ((r.ts as u64) << 32) | r.pc as u64;
-                    pos[pid] += 1;
+            for (&pid, &v) in pids.iter().zip(vals.iter()) {
+                // pid < npers = pos.len(), and pos[pid] < off[pid + 1] <= cap = evs.len()
+                unsafe {
+                    let p = pos.get_unchecked_mut(pid as usize);
+                    *evs.get_unchecked_mut(*p) = v;
+                    *p += 1;
                 }
             }
             // clicks of persons with events (pids reused for the click pass)
@@ -3107,10 +3345,7 @@ fn main_fast() -> bool {
             cp.clear();
             for s in p2.iter() {
                 for r in s.cl[q].iter() {
-                    let pid = match tab.find(h128(r.pk), |&i| names[i as usize] == r.pk) {
-                        Some(&i) => i,
-                        None => u32::MAX,
-                    };
+                    let pid = tab.find(r.pk);
                     if pid != u32::MAX {
                         ccnt[pid as usize] += 1;
                     }
@@ -3145,7 +3380,6 @@ fn main_fast() -> bool {
             let t1 = tcpu();
             st.t_grp += t1 - tt;
             for pid in 0..npers {
-                evs[off[pid]..off[pid + 1]].sort_unstable();
                 cks[coff[pid]..coff[pid + 1]].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| id_cmp(a.cid, b.cid)));
             }
             let t2 = tcpu();
@@ -3158,8 +3392,14 @@ fn main_fast() -> bool {
             let mut catsum: Vec<(u32, i64)> = Vec::new();
             let mut open: Vec<(u32, u32, u32, u32)> = Vec::new(); // (campaign, island start, island end, pad)
             let mut closed: Vec<(u32, u32, u32, u32)> = Vec::new();
+            let ses = &mut st.ses;
+            let pur = &mut st.pur;
             for pid in 0..npers {
-                let e = &evs[off[pid]..off[pid + 1]];
+                if p3sort {
+                    sessions_sort(&mut evs[off[pid]..off[pid + 1]], ses, pur);
+                } else {
+                    sessions_bucket(&evs[off[pid]..off[pid + 1]], &mut st.bk, ses, pur);
+                }
                 let c = &cks[coff[pid]..coff[pid + 1]];
                 let name = names[pid];
                 starts.clear();
@@ -3169,14 +3409,11 @@ fn main_fast() -> bool {
                 let (mut d_ses, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
                 catsum.clear();
                 let mut hi = 0usize;
-                let mut i = 0usize;
-                while i < e.len() {
-                    let start32 = (e[i] >> 32) as u32;
+                let mut pi = 0usize;
+                for &(start32, end32, nev) in ses.iter() {
                     let start = start32 as i64 + cw0;
-                    let mut j = i;
                     let mut rev = 0i64;
                     let mut purch = false;
-                    let mut prev = start32;
                     let day = start.div_euclid(DAY);
                     if day != cur_day {
                         if cur_day != i64::MIN {
@@ -3188,24 +3425,20 @@ fn main_fast() -> bool {
                         d_rev = 0;
                         catsum.clear();
                     }
-                    // equal timestamps have gap 0, so ties always share a session (order-free)
-                    while j < e.len() && ((e[j] >> 32) as u32) - prev <= gap {
-                        let x = e[j];
-                        prev = (x >> 32) as u32;
-                        let pc = x as u32;
-                        if pc != 0 {
-                            let (price, cat) = ((pc >> 8) as i64, pc & 0xFF);
-                            purch = true;
-                            rev += price;
-                            match catsum.iter_mut().find(|c| c.0 == cat) {
-                                Some(c) => c.1 += price,
-                                None => catsum.push((cat, price)),
-                            }
+                    // the session's purchases: the next ones in ts order up to its end
+                    while pi < pur.len() && ((pur[pi] >> 32) as u32) <= end32 {
+                        let pc = pur[pi] as u32;
+                        pi += 1;
+                        let (price, cat) = ((pc >> 8) as i64, pc & 0xFF);
+                        purch = true;
+                        rev += price;
+                        match catsum.iter_mut().find(|c| c.0 == cat) {
+                            Some(c) => c.1 += price,
+                            None => catsum.push((cat, price)),
                         }
-                        j += 1;
                     }
                     d_ses += 1;
-                    d_ev += (j - i) as i64;
+                    d_ev += nev as i64;
                     d_rev += rev;
                     starts.push(start);
                     sdays.push((day - day0) as u32);
@@ -3228,7 +3461,6 @@ fn main_fast() -> bool {
                     a[0] += 1;
                     a[1] += purch as i64;
                     a[2] += rev;
-                    i = j;
                 }
                 if cur_day != i64::MIN {
                     flush(&mut st.rows, name, cur_day, d_ses, d_ev, d_rev, &catsum);
@@ -3578,7 +3810,7 @@ fn main_wide() {
                     } else {
                         NOLOC
                     };
-                    match pack(f[0]) {
+                    match kfast_s(f[0]) {
                         Some(key) => {
                             let h = h128(key);
                             st.dd[((h >> 40) & dmask) as usize].push(&mut st.ar, DRec { key, ing, loc });
@@ -4707,6 +4939,65 @@ fn write_campaign(path: &Path, rows: &[(S, S, i32, [i64; 4])]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Differential test: phase-3 time-bucket sessions == sort + gap sweep, on random persons with gaps of
+    /// exactly GAP - 1 / GAP / GAP + 1, equal timestamps, purchases on session edges, any input order,
+    /// ts at both ends of the u32 range, and one reused bucket state (it must be empty after every call).
+    #[test]
+    fn sessions_bucket_matches_sort() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let g = GAP as u64;
+        let mut bk = Bk::new();
+        let (mut s1, mut p1, mut s2, mut p2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut nses = 0usize;
+        for it in 0..20_000u64 {
+            let n = if it % 500 == 0 { 3000 } else { rnd(60) as usize };
+            let mut t: u64 = match rnd(4) {
+                0 => rnd(4 * g),
+                1 => (1u64 << 32) - 1 - rnd(n as u64 * 3 * g + 1).min((1u64 << 32) - 1),
+                2 => rnd(1 << 31) / g * g, // on a bucket edge
+                _ => rnd(1 << 32),
+            };
+            let mut e: Vec<u64> = Vec::with_capacity(n);
+            for _ in 0..n {
+                if t >= 1u64 << 32 {
+                    break;
+                }
+                let pc = if rnd(5) == 0 { ((1 + rnd(1 << 20)) << 8 | rnd(256)) as u32 } else { 0 };
+                e.push(t << 32 | pc as u64);
+                t += match rnd(9) {
+                    0 => 0,
+                    1 => g - 1,
+                    2 => g,
+                    3 => g + 1,
+                    4 => 1,
+                    5 => rnd(g),
+                    6 => rnd(3 * g),
+                    7 => 86_400_000 - rnd(2),
+                    _ => rnd(WEEK as u64),
+                };
+            }
+            // shuffle: the bucket path must not depend on input order
+            for i in (1..e.len()).rev() {
+                let j = rnd(i as u64 + 1) as usize;
+                e.swap(i, j);
+            }
+            sessions_bucket(&e, &mut bk, &mut s1, &mut p1);
+            let mut es = e.clone();
+            sessions_sort(&mut es, &mut s2, &mut p2);
+            assert_eq!(s1, s2, "sessions differ (iteration {})", it);
+            assert_eq!(p1, p2, "purchases differ (iteration {})", it);
+            nses += s1.len();
+        }
+        assert!(bk.bits.iter().all(|&w| w == 0) && bk.bcnt.iter().all(|&c| c == 0));
+        assert!(bk.bmin.iter().all(|&m| m == u32::MAX) && bk.bmax.iter().all(|&m| m == 0));
+        assert!(nses > 100_000);
+    }
     /// Differential test: for_rows (mask tokenizer) == for_lines + split on adversarial CSV.
     fn check<const N: usize>(seed: u64) {
         let mut x = seed;
@@ -4936,6 +5227,56 @@ mod tests {
                 for d in 0..=32 {
                     assert_eq!(days_fast(y, m, d), days_from_civil(y, m, d), "{} {} {}", y, m, d);
                 }
+            }
+        }
+    }
+    /// z23 fast key: the 8-byte-load path == the slice path; fast keys exist exactly for
+    /// 2..=9 ASCII bytes without NUL; equality == byte equality, order == byte order, and
+    /// id_bytes round-trips, over random and adversarial IDs (uppercase, 10+ bytes, non-alnum,
+    /// NUL, high bytes, empty).
+    #[test]
+    fn kfast_matches_slice_and_bytes() {
+        let alpha: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCZ-_ ,.\"\x00\x7f\x80\xc3\xff\t";
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut ids: Vec<Vec<u8>> = vec![Vec::new(), b"e".to_vec(), b"\x00".to_vec(), b"u\x00".to_vec(), b"\x80a".to_vec(), b"uABCDEFGH".to_vec(), b"u12345678".to_vec(), b"u123456789".to_vec(), b"e0".to_vec(), b"e00".to_vec(), b"e0\x00".to_vec()];
+        for i in 0..40000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 14) as usize;
+            // half: generator-shaped (prefix + base36), half: any alphabet byte
+            let v: Vec<u8> = (0..n).map(|j| { let y = x.rotate_left(7 * j as u32) >> 3; if i % 2 == 0 { if j == 0 { b"euk"[(y % 3) as usize] } else { alpha[(y % 36) as usize] } } else { alpha[(y % alpha.len() as u64) as usize] } }).collect();
+            ids.push(v);
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut spans = Vec::new();
+        for v in &ids {
+            spans.push((buf.len(), v.len()));
+            buf.extend_from_slice(v);
+        }
+        let data: S = Box::leak(buf.into_boxed_slice());
+        let lim = data.as_ptr() as usize + data.len();
+        let mut nfast = 0;
+        for (i, &(a, n)) in spans.iter().enumerate() {
+            let f = &data[a..a + n];
+            let want = n >= 2 && n <= 9 && f.iter().all(|&c| c != 0 && c < 0x80);
+            assert_eq!(kfast(f, lim), kfast_s(f), "{:?}", f);
+            assert_eq!(kfast_s(f).is_some(), want, "{:?}", f);
+            nfast += want as usize;
+            assert_eq!(f, &ids[i][..]);
+        }
+        assert!(nfast > 15000);
+        let ks: Vec<K> = ids.iter().map(|v| idk(Box::leak(v.clone().into_boxed_slice()))).collect();
+        let kl: Vec<K> = spans.iter().map(|&(a, n)| idkf(&data[a..a + n], lim)).collect();
+        freeze_long();
+        for i in 0..ids.len() {
+            let mut b = Vec::new();
+            id_bytes(ks[i], &mut b);
+            assert_eq!(b, ids[i]);
+            assert_eq!(ks[i], kl[i]);
+            for j in [(i * 7919) % ids.len(), (i + 1) % ids.len(), (i * 31 + 5) % ids.len()] {
+                assert_eq!(id_cmp(ks[i], ks[j]), ids[i].cmp(&ids[j]), "{:?} {:?}", ids[i], ids[j]);
+                assert_eq!(ks[i] == ks[j], ids[i] == ids[j]);
             }
         }
     }
